@@ -196,6 +196,24 @@ class ArmConfig:
         default_factory=lambda: _env_float_list("VIAM_ARM_HOME_JOINTS")
     )
     default_frame: str = field(default_factory=lambda: os.environ.get("VIAM_ARM_FRAME", "world"))
+    calibrated_ik_enabled: bool = field(
+        default_factory=lambda: _env_bool("VIAM_ARM_CALIBRATED_IK_ENABLED", True)
+    )
+    ik_origin_offset_mm: list[float] = field(
+        default_factory=lambda: _env_float_list("VIAM_ARM_IK_ORIGIN_OFFSET_MM") or [0.0, 0.0, 0.0]
+    )
+    ik_link_lengths_mm: list[float] = field(
+        default_factory=lambda: _env_float_list("VIAM_ARM_IK_LINK_LENGTHS_MM") or [120.0, 123.0, 80.0]
+    )
+    ik_joint_multipliers: list[float] = field(
+        default_factory=lambda: _env_float_list("VIAM_ARM_IK_JOINT_MULTIPLIERS") or [1.0, 1.0, 1.0, 1.0]
+    )
+    ik_joint_offsets_deg: list[float] = field(
+        default_factory=lambda: _env_float_list("VIAM_ARM_IK_JOINT_OFFSETS_DEG") or [0.0, 0.0, 0.0, 0.0]
+    )
+    ik_default_tool_pitch_deg: float = field(
+        default_factory=lambda: _env_float("VIAM_ARM_IK_DEFAULT_TOOL_PITCH_DEG", -90.0)
+    )
 
 
 @dataclass

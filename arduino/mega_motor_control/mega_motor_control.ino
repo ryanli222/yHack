@@ -7,15 +7,31 @@
  *
  * Serial protocol (115200 baud, newline-delimited JSON):
  *   Receive: {"vx": float, "vy": float, "w": float}
+ *            "q"            — e-stop (stop all motors)
+ *            "r"            — resume (clear e-stop)
+ *            "w"            — forward
+ *            "s"            — backward
+ *            "a"            — strafe left
+ *            "d"            — strafe right
+ *            "e"            — turn CW
+ *            "f"            — turn CCW
+ *            "1"-"4"        — spin wheel CW  (FL, FR, RL, RR)
+ *            "5"-"8"        — spin wheel CCW (FL, FR, RL, RR)
+ *   Note: single-char movement commands run until watchdog cuts them (~500ms)
  *   Send:    {"estop": 0|1, "enc": [dFL, dFR, dRL, dRR]}
  *            enc = delta ticks since last report (signed int32)
  *
- * Encoder wiring (quadrature, 1x decode on channel A):
- *   FL: A=D2 (INT0),  B=D3
- *   FR: A=D18(INT5),  B=D19
- *   RL: A=D20(INT3),  B=D21
- *   RR: A=D22(polled),B=D23
- * E-stop: D32 (active LOW, polled — freed D2 for FL encoder)
+ * Motor driver wiring (IBT-2 RPWM/LPWM):
+ *   FL: RPWM=D13, LPWM=D12
+ *   FR: RPWM=D2,  LPWM=D3
+ *   RL: RPWM=D10, LPWM=D11
+ *   RR: RPWM=D4,  LPWM=D5
+ * Encoder wiring (quadrature, interrupt-driven on CHN A rising edge):
+ *   FL: CHN A=D18(INT5), CHN B=D22
+ *   FR: CHN A=D21(INT2), CHN B=D53
+ *   RL: CHN A=D20(INT3), CHN B=D52
+ *   RR: CHN A=D19(INT4), CHN B=D23
+ * E-stop: software only — send 'q' over serial
  *
  * Dependencies: ArduinoJson (v7.x)
  */
@@ -26,51 +42,49 @@
 // 1. PIN DEFINITIONS
 // ============================================================
 
-// Motor FL (Front-Left)
-#define PIN_FL_RPWM   4
-#define PIN_FL_LPWM   5
+// Motor FL (Front-Left)  — driver 1
+#define PIN_FL_RPWM  13
+#define PIN_FL_LPWM  12
 
-// Motor FR (Front-Right)
-#define PIN_FR_RPWM   6
-#define PIN_FR_LPWM   7
+// Motor FR (Front-Right) — driver 4
+#define PIN_FR_RPWM   2
+#define PIN_FR_LPWM   3
 
-// Motor RL (Rear-Left)
-#define PIN_RL_RPWM   8
-#define PIN_RL_LPWM   9
+// Motor RL (Rear-Left)   — driver 2
+#define PIN_RL_RPWM  10
+#define PIN_RL_LPWM  11
 
-// Motor RR (Rear-Right)
-#define PIN_RR_RPWM  10
-#define PIN_RR_LPWM  11
+// Motor RR (Rear-Right)  — driver 3
+#define PIN_RR_RPWM   4
+#define PIN_RR_LPWM   5
 
-// E-stop button (active LOW, polled — D32 has no external INT on Mega)
-#define PIN_ESTOP     32
-
-// Encoder channel A pins (interrupt-driven for FL/FR/RL, polled for RR)
-#define PIN_ENC_FL_A   2   // INT0
-#define PIN_ENC_FL_B   3
-#define PIN_ENC_FR_A  18   // INT5
-#define PIN_ENC_FR_B  19
+// Encoder CHN A pins (interrupt-driven — INT5/4/3/2)
+#define PIN_ENC_FL_A  18   // INT5
+#define PIN_ENC_FR_A  21   // INT2
 #define PIN_ENC_RL_A  20   // INT3
-#define PIN_ENC_RL_B  21
-#define PIN_ENC_RR_A  22   // polled
+#define PIN_ENC_RR_A  19   // INT4
+// Encoder CHN B pins (direction sense, read inside ISR)
+#define PIN_ENC_FL_B  22
+#define PIN_ENC_FR_B  53
+#define PIN_ENC_RL_B  52
 #define PIN_ENC_RR_B  23
 
 // ============================================================
 // 2. CONFIGURATION
 // ============================================================
 
-// Motor direction signs: flip to +1 or -1 after hardware test.
+// Motor direction signs: FL/RR pair, FR/RL pair inverted for correct strafe.
 //                          FL   FR   RL   RR
-const int MOTOR_SIGN[4] = { +1,  +1,  +1,  +1 };
+const int MOTOR_SIGN[4] = { -1,  +1,  -1,  +1 };
 
 // Encoder direction signs: flip if ticks go negative during forward motion.
 //                            FL   FR   RL   RR
 const int ENC_SIGN[4]   = { +1,  +1,  +1,  +1 };
 
-#define PWM_MAX              60   // SAFETY: keep low until hardware verified. Max is 255.
+#define PWM_MAX             100   // ~40% duty cycle. Raise toward 255 if motors still stall.
 #define SERIAL_BAUD         115200
-#define WATCHDOG_TIMEOUT_MS 500
-#define LOOP_PERIOD_MS       10   // ~100 Hz
+#define WATCHDOG_TIMEOUT_MS 1000
+#define LOOP_PERIOD_MS       50   // ~20 Hz
 #define SERIAL_BUF_SIZE     128
 
 // ============================================================
@@ -91,14 +105,16 @@ unsigned long lastCommandTime = 0;
 char serialBuf[SERIAL_BUF_SIZE];
 uint8_t serialBufIdx = 0;
 
-// ---- Encoder counters (volatile, written from ISRs) ----
+// Encoder counters (volatile, written from ISRs)
 volatile int32_t encCount[4] = { 0, 0, 0, 0 };
 
-// Last sent counts — we report delta ticks each loop
-int32_t encLast[4] = { 0, 0, 0, 0 };
+// Encoder snapshot taken at command start — for one-shot end-of-run report
+int32_t encRunStart[4] = { 0, 0, 0, 0 };
 
-// Last known state of RR channel A (for polling)
-uint8_t rrLastA = 0;
+// motorCommand snapshot at run start — to know which motors were active
+int activeMotors[4] = { 0, 0, 0, 0 };
+
+bool motorsRunning = false;
 
 // ============================================================
 // 4. ENCODER ISRs
@@ -117,6 +133,11 @@ void encISR_FR() {
 void encISR_RL() {
   if (digitalRead(PIN_ENC_RL_B) == HIGH) encCount[RL] += ENC_SIGN[RL];
   else                                    encCount[RL] -= ENC_SIGN[RL];
+}
+
+void encISR_RR() {
+  if (digitalRead(PIN_ENC_RR_B) == HIGH) encCount[RR] += ENC_SIGN[RR];
+  else                                    encCount[RR] -= ENC_SIGN[RR];
 }
 
 // ============================================================
@@ -153,11 +174,13 @@ void stopAllMotors() {
 // ============================================================
 
 void computeMecanumIK(float vx, float vy, float omega) {
+  // X mecanum configuration — rollers diagonal is opposite to H/O drive.
+  // FL/RR share +Vy; FR/RL share -Vy.
   float raw[4];
-  raw[FL] = vx - vy - omega;
-  raw[FR] = vx + vy + omega;
-  raw[RL] = vx + vy - omega;
-  raw[RR] = vx - vy + omega;
+  raw[FL] = vx + vy - omega;
+  raw[FR] = vx - vy + omega;
+  raw[RL] = vx - vy - omega;
+  raw[RR] = vx + vy + omega;
 
   float maxVal = 0.0f;
   for (uint8_t i = 0; i < 4; i++) {
@@ -177,7 +200,50 @@ void computeMecanumIK(float vx, float vy, float omega) {
 // 7. SERIAL PARSING
 // ============================================================
 
+// Set one motor, zero the rest — used for per-wheel spin tests
+void spinOneMotor(uint8_t idx, int speed) {
+  for (uint8_t i = 0; i < 4; i++) motorCommand[i] = 0;
+  motorCommand[idx] = speed;
+}
+
 bool processSerialLine(const char* line) {
+  if (line[1] != '\0') goto json;  // more than one char → must be JSON
+
+  switch (line[0]) {
+    // ---- control ----
+    case 'q':
+      estopActive = true;
+      stopAllMotors();
+      return true;
+    case 'r':
+      estopActive = false;
+      lastCommandTime = millis();
+      return true;
+
+    // ---- directional (wasd) ----
+    case 'w': computeMecanumIK( 1.0f,  0.0f, 0.0f); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case 's': computeMecanumIK(-1.0f,  0.0f, 0.0f); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case 'a': computeMecanumIK( 0.0f, -1.0f, 0.0f); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case 'd': computeMecanumIK( 0.0f,  1.0f, 0.0f); lastCommandTime = millis(); startRunSnapshot(); return true;
+
+    // ---- turn (e/f) ----
+    case 'e': computeMecanumIK( 0.0f,  0.0f, -1.0f); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case 'f': computeMecanumIK( 0.0f,  0.0f,  1.0f); lastCommandTime = millis(); startRunSnapshot(); return true;
+
+    // ---- individual wheel CW (1-4 = FL, FR, RL, RR) ----
+    case '1': spinOneMotor(FL,  PWM_MAX); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case '2': spinOneMotor(FR,  PWM_MAX); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case '3': spinOneMotor(RL,  PWM_MAX); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case '4': spinOneMotor(RR,  PWM_MAX); lastCommandTime = millis(); startRunSnapshot(); return true;
+
+    // ---- individual wheel CCW (5-8 = FL, FR, RL, RR) ----
+    case '5': spinOneMotor(FL, -PWM_MAX); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case '6': spinOneMotor(FR, -PWM_MAX); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case '7': spinOneMotor(RL, -PWM_MAX); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case '8': spinOneMotor(RR, -PWM_MAX); lastCommandTime = millis(); startRunSnapshot(); return true;
+  }
+
+json:
   JsonDocument doc;
   if (deserializeJson(doc, line)) return false;
   if (!doc.containsKey("vx") || !doc.containsKey("vy") || !doc.containsKey("w")) return false;
@@ -205,29 +271,35 @@ void readSerial() {
 }
 
 // ============================================================
-// 8. SERIAL RESPONSE
+// 8. ENCODER REPORTING
 // ============================================================
 
-void sendStatus() {
-  // Atomically snapshot delta ticks (disable interrupts briefly)
+// Call when a new command starts — snapshot current counts and record active motors
+void startRunSnapshot() {
+  noInterrupts();
+  for (uint8_t i = 0; i < 4; i++) encRunStart[i] = encCount[i];
+  interrupts();
+  for (uint8_t i = 0; i < 4; i++) activeMotors[i] = motorCommand[i];
+  motorsRunning = true;
+
+  Serial.print("start enc: FL="); Serial.print(encRunStart[FL]);
+  Serial.print(" FR=");           Serial.print(encRunStart[FR]);
+  Serial.print(" RL=");           Serial.print(encRunStart[RL]);
+  Serial.print(" RR=");           Serial.println(encRunStart[RR]);
+}
+
+// Call once when motors stop — print delta ticks for active motors only
+void printRunReport() {
   int32_t snap[4];
   noInterrupts();
   for (uint8_t i = 0; i < 4; i++) snap[i] = encCount[i];
   interrupts();
 
-  int32_t delta[4];
-  for (uint8_t i = 0; i < 4; i++) {
-    delta[i] = snap[i] - encLast[i];
-    encLast[i] = snap[i];
-  }
-
-  JsonDocument doc;
-  doc["estop"] = estopActive ? 1 : 0;
-  JsonArray enc = doc["enc"].to<JsonArray>();
-  for (uint8_t i = 0; i < 4; i++) enc.add(delta[i]);
-
-  serializeJson(doc, Serial);
-  Serial.println();
+  Serial.print("end enc: FL="); Serial.print(snap[FL] - encRunStart[FL]);
+  Serial.print(" FR=");         Serial.print(snap[FR] - encRunStart[FR]);
+  Serial.print(" RL=");         Serial.print(snap[RL] - encRunStart[RL]);
+  Serial.print(" RR=");         Serial.println(snap[RR] - encRunStart[RR]);
+  motorsRunning = false;
 }
 
 // ============================================================
@@ -245,26 +317,16 @@ void setup() {
     analogWrite(pinLPWM[i], 0);
   }
 
-  // E-stop (active LOW, internal pull-up, polled)
-  pinMode(PIN_ESTOP, INPUT_PULLUP);
-  estopActive = (digitalRead(PIN_ESTOP) == LOW);
-
-  // Encoder channel A — interrupt pins
-  pinMode(PIN_ENC_FL_A, INPUT_PULLUP);
-  pinMode(PIN_ENC_FL_B, INPUT_PULLUP);
-  pinMode(PIN_ENC_FR_A, INPUT_PULLUP);
-  pinMode(PIN_ENC_FR_B, INPUT_PULLUP);
-  pinMode(PIN_ENC_RL_A, INPUT_PULLUP);
-  pinMode(PIN_ENC_RL_B, INPUT_PULLUP);
+  // Encoder pins
+  pinMode(PIN_ENC_FL_A, INPUT_PULLUP); pinMode(PIN_ENC_FL_B, INPUT_PULLUP);
+  pinMode(PIN_ENC_FR_A, INPUT_PULLUP); pinMode(PIN_ENC_FR_B, INPUT_PULLUP);
+  pinMode(PIN_ENC_RL_A, INPUT_PULLUP); pinMode(PIN_ENC_RL_B, INPUT_PULLUP);
+  pinMode(PIN_ENC_RR_A, INPUT_PULLUP); pinMode(PIN_ENC_RR_B, INPUT_PULLUP);
 
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_FL_A), encISR_FL, RISING);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_FR_A), encISR_FR, RISING);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_RL_A), encISR_RL, RISING);
-
-  // RR encoder — polled
-  pinMode(PIN_ENC_RR_A, INPUT_PULLUP);
-  pinMode(PIN_ENC_RR_B, INPUT_PULLUP);
-  rrLastA = digitalRead(PIN_ENC_RR_A);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_RR_A), encISR_RR, RISING);
 
   lastCommandTime = millis();
   Serial.println("{\"status\":\"ready\"}");
@@ -279,22 +341,11 @@ void loop() {
 
   readSerial();
 
-  // Poll e-stop
-  estopActive = (digitalRead(PIN_ESTOP) == LOW);
-
   // Watchdog
   if ((millis() - lastCommandTime) > WATCHDOG_TIMEOUT_MS) {
+    if (motorsRunning) printRunReport();
     stopAllMotors();
   }
-
-  // Poll RR encoder (channel A rising edge)
-  uint8_t rrNowA = digitalRead(PIN_ENC_RR_A);
-  if (rrNowA == HIGH && rrLastA == LOW) {
-    // Rising edge detected
-    if (digitalRead(PIN_ENC_RR_B) == HIGH) encCount[RR] += ENC_SIGN[RR];
-    else                                    encCount[RR] -= ENC_SIGN[RR];
-  }
-  rrLastA = rrNowA;
 
   // Drive or stop motors
   if (estopActive) {
@@ -302,8 +353,6 @@ void loop() {
   } else {
     for (uint8_t i = 0; i < 4; i++) setMotor(i, motorCommand[i]);
   }
-
-  sendStatus();
 
   // Maintain loop rate
   unsigned long elapsed = millis() - loopStart;

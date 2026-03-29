@@ -42,6 +42,10 @@ def pose_from_meters(x_m: float, y_m: float, z_m: float) -> dict[str, float]:
         x=float(x_m) * 1000.0,
         y=float(y_m) * 1000.0,
         z=float(z_m) * 1000.0,
+        o_x=0.0,
+        o_y=0.0,
+        o_z=-1.0,  # gripper points down for floor-level pickup
+        theta=0.0,
     )
     return pose.to_dict()
 

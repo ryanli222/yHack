@@ -8,6 +8,11 @@ exercise the local FakeArmControl instead.
 Examples:
     python laptop/arm_voice_demo.py
     python laptop/arm_voice_demo.py --local-fake
+    python laptop/arm_voice_demo.py --typed-input --local-fake
+    # then type: move left 5
+    # or: move y to -10
+    # or: rotate left 5 degrees
+    # or: rotate up 5 degrees
     python laptop/arm_voice_demo.py --fake-voice --transcript "open the gripper" --once
 """
 
@@ -19,15 +24,33 @@ import logging
 import math
 import re
 import sys
-import time
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
+
+try:
+    import msvcrt  # Windows non-blocking key check
+
+    def _kbhit_q() -> bool:
+        """Return True if 'q' was pressed (non-blocking, Windows)."""
+        if msvcrt.kbhit():
+            key = msvcrt.getch().decode("utf-8", errors="ignore").lower()
+            return key == "q"
+        return False
+except ImportError:
+    def _kbhit_q() -> bool:
+        """Non-Windows stub — no non-blocking key check available."""
+        return False
 
 # Ensure laptop/ is importable when run as a script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from arm_control import ArmControlError, ArmPose, create_arm_control
-from arm_voice_flow import create_arm_parser, dispatch_arm_command
+from arm_voice_flow import (
+    create_arm_parser,
+    dispatch_arm_command,
+    target_pose_from_fields,
+    target_pose_from_relative,
+)
 from config import load_config
 from voice import create_voice_interface
 
@@ -36,7 +59,7 @@ DEFAULT_CONFIRM_DELAY_S = 3.0
 DEFAULT_CHECKPOINT_INTERVAL_S = 5.0
 DEFAULT_CONFIRM_TIMEOUT_S = 3.0
 DEFAULT_MAX_CARTESIAN_STEP_MM = 20.0
-DEFAULT_MAX_JOINT_STEP = 5.0
+DEFAULT_MAX_JOINT_STEP = 10.0
 
 
 def _console_safe(value: object) -> str:
@@ -50,7 +73,15 @@ def _requires_confirmation(command: Mapping[str, Any]) -> bool:
 
 
 def _is_segmented_motion(command: Mapping[str, Any]) -> bool:
-    return str(command.get("cmd", "")).lower() in {"move_joint", "move_joints", "move_to_position", "home"}
+    return str(command.get("cmd", "")).lower() in {
+        "move_joint",
+        "move_joint_relative",
+        "move_joints",
+        "move_to_position",
+        "move_axis_to",
+        "move_relative",
+        "home",
+    }
 
 
 def _describe_command(command: Mapping[str, Any]) -> str:
@@ -63,13 +94,28 @@ def _describe_command(command: Mapping[str, Any]) -> str:
         return "move the arm home"
     if cmd == "move_joint":
         return f"move joint {int(command.get('joint_index', 0)) + 1} to {float(command.get('value', 0.0)):.1f}"
+    if cmd == "move_joint_relative":
+        direction = str(command.get("direction", "")).lower()
+        if direction in {"left", "right", "up", "down"}:
+            return f"rotate {direction} by {abs(float(command.get('delta_degrees', 0.0))):.1f} degrees"
+        return (
+            f"move joint {int(command.get('joint_index', 0)) + 1} "
+            f"by {float(command.get('delta_degrees', 0.0)):.1f} degrees"
+        )
     if cmd == "move_joints":
         return f"move joints to {list(command.get('joints', []))}"
     if cmd == "move_to_position":
         pose = dict(command.get("pose", {}))
         return (
-            f"move arm to x={float(pose.get('x', 0.0)):.1f}, "
+            f"move gripper to x={float(pose.get('x', 0.0)):.1f}, "
             f"y={float(pose.get('y', 0.0)):.1f}, z={float(pose.get('z', 0.0)):.1f}"
+        )
+    if cmd == "move_axis_to":
+        return f"move gripper {str(command.get('axis', '?')).lower()} to {float(command.get('value', 0.0)):.1f}"
+    if cmd == "move_relative":
+        return (
+            f"move gripper {str(command.get('direction', 'relative')).lower()} "
+            f"by {abs(float(command.get('distance_mm', 0.0))):.1f} mm"
         )
     if cmd == "stop":
         return "emergency stop"
@@ -80,6 +126,18 @@ def _describe_command(command: Mapping[str, Any]) -> str:
 
 class SafetyAbortError(RuntimeError):
     """Raised when an operator safety checkpoint is not confirmed in time."""
+
+
+async def _pause_with_estop(duration_s: float) -> bool:
+    """Sleep for *duration_s*, polling for 'q' keypress. Returns True if e-stop triggered."""
+    elapsed = 0.0
+    step = 0.05
+    while elapsed < duration_s:
+        if _kbhit_q():
+            return True
+        await asyncio.sleep(step)
+        elapsed += step
+    return False
 
 
 def _approval_from_text(text: str) -> bool:
@@ -137,6 +195,14 @@ def _build_pose_segments(current: ArmPose, target: ArmPose, *, max_cartesian_ste
     return segments
 
 
+def _clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
+
+
+def _wrap_degrees(value: float) -> float:
+    return ((float(value) + 180.0) % 360.0) - 180.0
+
+
 async def _wait_for_confirmation(command: Mapping[str, Any], *, confirm_prompt: bool, delay_s: float) -> bool:
     description = _describe_command(command)
     if confirm_prompt:
@@ -175,7 +241,7 @@ async def _checkpoint_confirmation(
     spoken_prompt = f"Safety check. Say yes within {confirm_timeout_s:.0f} seconds to continue."
     print(_console_safe(message))
 
-    if use_cli_prompt and sys.stdin.isatty():
+    if use_cli_prompt:
         try:
             answer = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -198,6 +264,48 @@ async def _checkpoint_confirmation(
     return False
 
 
+async def _read_command_text(
+    voice: Any,
+    *,
+    typed_input: bool,
+    input_reader: Callable[[str], str] = input,
+) -> str:
+    if not typed_input:
+        return await voice.listen()
+
+    try:
+        return (await asyncio.to_thread(input_reader, _console_safe("arm> "))).strip()
+    except EOFError:
+        print("Input closed. Exiting arm test.")
+        return "exit"
+
+
+async def _deliver_response(voice: Any, text: str, *, typed_input: bool) -> None:
+    if not text:
+        return
+    if typed_input:
+        print(_console_safe(f"Response: {text}"))
+        return
+    await voice.speak(text)
+
+
+async def _dispatch_with_estop(arm: Any, command: Mapping[str, Any]) -> dict[str, Any]:
+    """Dispatch an arm command while polling for 'q' e-stop in parallel."""
+    task = asyncio.create_task(dispatch_arm_command(arm, command))
+    try:
+        while not task.done():
+            if _kbhit_q():
+                task.cancel()
+                print("E-stop! Pressing q detected — stopping arm.")
+                await arm.emergency_stop()
+                raise SafetyAbortError("Emergency stop requested (q pressed).")
+            await asyncio.sleep(0.05)
+        return task.result()
+    except asyncio.CancelledError:
+        await arm.emergency_stop()
+        raise SafetyAbortError("Emergency stop requested (q pressed).")
+
+
 async def execute_guarded_arm_command(
     arm: Any,
     voice: Any,
@@ -209,83 +317,15 @@ async def execute_guarded_arm_command(
     max_joint_step: float,
     use_cli_prompt: bool,
 ) -> dict[str, Any]:
-    cmd = str(command.get("cmd", "")).lower()
-    if not _is_segmented_motion(command):
-        return await dispatch_arm_command(arm, command)
-
-    if cmd == "move_joint":
-        state = await arm.get_state()
-        target_index = int(command["joint_index"])
-        target_value = float(command["value"])
-        current = list(state.joint_positions)
-        if not current:
-            current = [0.0] * max(target_index + 1, 5)
-        elif target_index >= len(current):
-            current.extend([0.0] * (target_index + 1 - len(current)))
-        target = list(current)
-        target[target_index] = target_value
-        segments = _build_joint_segments(current, target, max_joint_step=max_joint_step)
-        segment_commands = [{"cmd": "move_joints", "joints": values} for values in segments]
-        result_payload = {"handled": cmd, "joint_index": target_index, "value": target_value}
-    elif cmd == "move_joints":
-        state = await arm.get_state()
-        target = [float(value) for value in command.get("joints", [])]
-        current = list(state.joint_positions)
-        segments = _build_joint_segments(current, target, max_joint_step=max_joint_step)
-        segment_commands = [{"cmd": "move_joints", "joints": values} for values in segments]
-        result_payload = {"handled": cmd, "joint_count": len(target)}
-    elif cmd == "move_to_position":
-        state = await arm.get_state()
-        current_pose = ArmPose.from_value(state.pose)
-        target_pose = ArmPose.from_value(command.get("pose", {}))
-        segments = _build_pose_segments(
-            current_pose,
-            target_pose,
-            max_cartesian_step_mm=max_cartesian_step_mm,
-        )
-        segment_commands = [{"cmd": "move_to_position", "pose": segment.to_dict()} for segment in segments]
-        result_payload = {"handled": cmd, "pose": target_pose.to_dict()}
-    else:  # home
-        home_joints = list(load_config().arm.home_joint_positions)
-        if home_joints:
-            state = await arm.get_state()
-            segments = _build_joint_segments(
-                list(state.joint_positions),
-                home_joints,
-                max_joint_step=max_joint_step,
-            )
-            segment_commands = [{"cmd": "move_joints", "joints": values} for values in segments]
-            result_payload = {"handled": cmd}
-        else:
-            return await dispatch_arm_command(arm, command)
-
-    total_segments = max(1, len(segment_commands))
-    next_checkpoint = time.monotonic() + checkpoint_interval_s if checkpoint_interval_s > 0 else time.monotonic()
-    for segment_idx, segment_command in enumerate(segment_commands, start=1):
-        if checkpoint_interval_s <= 0 or time.monotonic() >= next_checkpoint:
-            approved = await _checkpoint_confirmation(
-                voice,
-                command,
-                segment_idx=segment_idx,
-                total_segments=total_segments,
-                confirm_timeout_s=confirm_timeout_s,
-                use_cli_prompt=use_cli_prompt,
-            )
-            if not approved:
-                await arm.emergency_stop()
-                raise SafetyAbortError("Safety checkpoint timed out or was rejected.")
-            next_checkpoint = time.monotonic() + checkpoint_interval_s if checkpoint_interval_s > 0 else time.monotonic()
-
-        await dispatch_arm_command(arm, segment_command)
-        print(_console_safe(f"Completed segment {segment_idx}/{total_segments} for {_describe_command(command)}."))
-
-    return {"ok": True, "segmented": True, "segments": total_segments, **result_payload}
+    """Execute an arm command with 'q' e-stop monitoring. VIAM handles smooth motion."""
+    return await _dispatch_with_estop(arm, command)
 
 
 async def run_demo(
     *,
     local_fake: bool = False,
     fake_voice: bool = False,
+    typed_input: bool = False,
     transcript: str = "",
     once: bool = False,
     confirm_prompt: bool = False,
@@ -296,7 +336,7 @@ async def run_demo(
     max_joint_step: float = DEFAULT_MAX_JOINT_STEP,
 ) -> None:
     arm = create_arm_control(fake=local_fake)
-    voice = create_voice_interface(fake=fake_voice)
+    voice = create_voice_interface(fake=(fake_voice or typed_input))
     parser = create_arm_parser()
 
     await voice.start()
@@ -306,12 +346,25 @@ async def run_demo(
         await voice.stop()
         raise
 
-    if fake_voice and transcript and hasattr(voice, "inject_transcript"):
+    if fake_voice and not typed_input and transcript and hasattr(voice, "inject_transcript"):
         voice.inject_transcript(transcript)
 
-    print("Voice arm demo ready.")
-    print("Say commands like: 'open the gripper', 'close the gripper', 'move joint 2 to 45',")
-    print("or 'move arm to x 100 y 0 z 200'. Say 'exit' to stop.")
+    if typed_input:
+        print("Typed arm demo ready.")
+        print("Type commands like: 'open the gripper', 'close the gripper', 'move left 5',")
+        print("'move up 10', 'move y to -10', 'move gripper to x 255 y -8 z 221', or 'move gripper to 255, -8, 221'.")
+        print("For degree rotation, use explicit phrases like 'rotate left 5 degrees', 'turn right 10 degrees', or 'rotate up 5 degrees'.")
+        print("Forward/back/left/right move in the current gripper frame. Up/down are vertical pose nudges.")
+        print("Distances use millimeters unless you add a unit.")
+        print("Press 'q' during motion to emergency stop. Type 'exit' to quit.")
+    else:
+        print("Voice arm demo ready.")
+        print("Say commands like: 'open the gripper', 'close the gripper', 'move left 5',")
+        print("'move up 10', 'move y to -10', or 'move gripper to 255, -8, 221'.")
+        print("For degree rotation, say explicit phrases like 'rotate left 5 degrees', 'turn right 10 degrees', or 'rotate up 5 degrees'.")
+        print("Forward/back/left/right move in the current gripper frame. Up/down are vertical pose nudges.")
+        print("Distances use millimeters unless you add a unit.")
+        print("Say 'exit' to stop.")
     if confirm_prompt or delay_s > 0:
         print(
             _console_safe(
@@ -322,18 +375,22 @@ async def run_demo(
     print(
         _console_safe(
             "Segmented motion safety enabled: "
-            f"checkpoint every {checkpoint_interval_s:.1f}s, "
+            "confirmation after every segment, "
             f"timeout {confirm_timeout_s:.1f}s, "
             f"max cartesian step {max_cartesian_step_mm:.1f}mm, "
             f"max joint step {max_joint_step:.1f}."
         )
     )
+    use_cli_checkpoints = typed_input or confirm_prompt
 
     try:
         while True:
-            heard = await voice.listen()
+            heard = await _read_command_text(voice, typed_input=typed_input)
             if not heard:
-                await voice.speak("I didn't hear a command.")
+                if typed_input:
+                    print("No command entered.")
+                else:
+                    await _deliver_response(voice, "I didn't hear a command.", typed_input=typed_input)
                 if once:
                     break
                 continue
@@ -352,7 +409,7 @@ async def run_demo(
                     result = {"ok": False, "handled": str(command.get("cmd", "unknown")), "cancelled": True}
                     speech = "Cancelled."
                     print(_console_safe(f"Result: {ascii(result)}"))
-                    await voice.speak(speech)
+                    await _deliver_response(voice, speech, typed_input=typed_input)
                     if once:
                         break
                     continue
@@ -366,21 +423,21 @@ async def run_demo(
                     confirm_timeout_s=confirm_timeout_s,
                     max_cartesian_step_mm=max_cartesian_step_mm,
                     max_joint_step=max_joint_step,
-                    use_cli_prompt=confirm_prompt,
+                    use_cli_prompt=use_cli_checkpoints,
                 )
             except SafetyAbortError as exc:
                 logger.warning("Arm motion stopped by safety checkpoint: %s", exc)
-                await voice.speak("Safety checkpoint missed. Shutting down arm test.")
+                await _deliver_response(voice, "Safety checkpoint missed. Shutting down arm test.", typed_input=typed_input)
                 break
             except ArmControlError as exc:
                 logger.error("Arm command failed: %s", exc)
-                await voice.speak("Arm command failed.")
+                await _deliver_response(voice, "Arm command failed.", typed_input=typed_input)
                 if once:
                     break
                 continue
 
             print(_console_safe(f"Result: {ascii(result)}"))
-            await voice.speak(speech)
+            await _deliver_response(voice, speech, typed_input=typed_input)
 
             if command.get("cmd") == "exit":
                 break
@@ -392,11 +449,16 @@ async def run_demo(
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Standalone voice-to-arm demo")
+    parser = argparse.ArgumentParser(description="Standalone voice or typed arm demo")
     parser.add_argument(
         "--local-fake",
         action="store_true",
         help="Use the local FakeArmControl instead of connecting to VIAM resources",
+    )
+    parser.add_argument(
+        "--typed-input",
+        action="store_true",
+        help="Read commands from the terminal instead of the microphone",
     )
     parser.add_argument(
         "--fake-voice",
@@ -436,7 +498,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--checkpoint-seconds",
         type=float,
         default=DEFAULT_CHECKPOINT_INTERVAL_S,
-        help="Pause motion and ask for confirmation this often while segmented moves are running",
+        help="Retained for compatibility; segmented moves now ask for confirmation after every segment",
     )
     parser.add_argument(
         "--confirmation-timeout-seconds",
@@ -473,7 +535,7 @@ async def _main() -> int:
     if args.max_cartesian_step_mm <= 0 or args.max_joint_step <= 0:
         print("--max-cartesian-step-mm and --max-joint-step must be positive.")
         return 2
-    default_confirm = sys.stdin.isatty() and not args.local_fake and not args.fake_voice
+    default_confirm = sys.stdin.isatty() and not args.local_fake and not args.fake_voice and not args.typed_input
     confirm_prompt = default_confirm if args.confirm is None else bool(args.confirm)
     delay_s = args.delay_seconds
     if delay_s is None:
@@ -482,6 +544,7 @@ async def _main() -> int:
         await run_demo(
             local_fake=args.local_fake,
             fake_voice=args.fake_voice,
+            typed_input=args.typed_input,
             transcript=args.transcript,
             once=args.once,
             confirm_prompt=confirm_prompt,
