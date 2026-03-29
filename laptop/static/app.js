@@ -1,10 +1,23 @@
+/**
+ * Floating windows: drag title bars, minimize / maximize, layout persisted in localStorage.
+ */
+
+const WINDOW_IDS = ["map", "camera", "telemetry", "systems", "world", "ops", "config", "logs"];
+const SECONDARY_IDS = ["systems", "world", "ops", "config", "logs"];
+const STORAGE_WINDOWS = "wheelchairFloatWindows";
+
+let windowLayout = {};
+let zCounter = 30;
+let dragState = null;
+/** Saved normal rect when maximizing (per window id). */
+const maxRestore = {};
+
 const dashboardState = {
   snapshot: null,
   ws: null,
   reconnectTimer: null,
-  configRenderedHash: "",
   mapMode: "goal",
-  foxgloveEmbedUrl: "",
+  configRenderedHash: "",
   keyboardVector: { vx: 0, vy: 0, omega: 0 },
   keyboardInterval: null,
   joystick: {
@@ -18,15 +31,20 @@ const dashboardState = {
 };
 
 const elements = {};
+const MAX_LOGS = 250;
 
 document.addEventListener("DOMContentLoaded", () => {
   cacheElements();
+  initFloatingWindows();
   bindEvents();
   connectWebSocket();
   refreshWaypoints();
   refreshConfig();
   initCameraStream();
-  resizeCanvases();
+  requestAnimationFrame(() => {
+    resizeCanvases();
+    renderAll();
+  });
   window.addEventListener("resize", () => {
     resizeCanvases();
     renderAll();
@@ -34,34 +52,25 @@ document.addEventListener("DOMContentLoaded", () => {
 });
 
 function cacheElements() {
-  const ids = [
+  [
     "robot-name",
-    "sidebar-robot-name",
-    "breadcrumb-root",
-    "breadcrumb-leaf",
     "connection-pill",
-    "sidebar-live-pill",
     "snapshot-rate",
-    "robot-dot",
-    "robot-status-text",
-    "subsystems-tree",
-    "modules-list",
-    "pose-x",
-    "pose-y",
-    "pose-theta",
-    "pose-frame",
-    "pose-cov-xy",
-    "pose-cov-theta",
-    "vel-vx",
-    "vel-vy",
-    "vel-omega",
-    "nav-mode",
-    "nav-state",
+    "map-canvas",
+    "map-mode-label",
+    "map-cursor-coords",
+    "camera-stream",
+    "camera-overlay",
+    "pose-xyz",
+    "pose-vel-line",
+    "nav-line",
     "nav-estop",
-    "imu-status",
     "imu-gyro-z",
-    "imu-age",
+    "joystick-pad",
+    "joystick-knob",
+    "joystick-readout",
     "waypoint-select",
+    "goal-summary",
     "arm-voice-pill",
     "arm-voice-detail",
     "arm-voice-start-button",
@@ -71,48 +80,438 @@ function cacheElements() {
     "pickup-refresh-button",
     "pickup-start-button",
     "pickup-stop-button",
-    "pickup-label",
-    "pickup-confidence",
-    "pickup-range",
-    "pickup-lateral",
-    "pickup-zone",
-    "pickup-attempts",
-    "goal-summary",
-    "command-queue-note",
-    "map-canvas",
-    "map-mode-label",
-    "map-cursor-coords",
-    "camera-stream",
-    "camera-overlay",
-    "foxglove-status-pill",
-    "foxglove-note",
-    "foxglove-ws-url",
-    "foxglove-frame",
-    "obstacles-list",
-    "landmarks-list",
     "voice-transcript",
     "voice-response",
-    "log-viewer",
+    "subsystems-tree",
+    "obstacles-list",
+    "landmarks-list",
     "config-form",
     "config-note",
-    "joystick-pad",
-    "joystick-knob",
-    "joystick-readout",
-  ];
-  ids.forEach((id) => {
+    "log-viewer",
+  ].forEach((id) => {
     elements[id] = document.getElementById(id);
   });
-  elements.tabButtons = Array.from(document.querySelectorAll(".tab-button"));
-  elements.tabContents = Array.from(document.querySelectorAll(".tab-content"));
-  elements.mapModeButtons = Array.from(document.querySelectorAll(".map-mode-button"));
-  elements.teleopButtons = Array.from(document.querySelectorAll(".teleop-button"));
+  elements.mapModeButtons = Array.from(document.querySelectorAll("[data-map-mode]"));
+  elements.teleopButtons = Array.from(document.querySelectorAll(".pad-btn[data-teleop]"));
+}
+
+function defaultWindowLayout() {
+  return {
+    map: { x: 0.02, y: 0.05, w: 0.71, h: 0.44, min: false, max: false, z: 10 },
+    camera: { x: 0.02, y: 0.51, w: 0.71, h: 0.42, min: false, max: false, z: 11 },
+    telemetry: { x: 0.745, y: 0.05, w: 0.235, h: 0.88, min: false, max: false, z: 12 },
+    systems: {
+      x: 0.05,
+      y: 0.48,
+      w: 0.32,
+      h: 0.4,
+      min: false,
+      max: false,
+      z: 13,
+      norm: { x: 0.05, y: 0.48, w: 0.32, h: 0.4 },
+      opened: false,
+    },
+    world: {
+      x: 0.37,
+      y: 0.48,
+      w: 0.32,
+      h: 0.4,
+      min: false,
+      max: false,
+      z: 14,
+      norm: { x: 0.37, y: 0.48, w: 0.32, h: 0.4 },
+      opened: false,
+    },
+    ops: {
+      x: 0.52,
+      y: 0.48,
+      w: 0.32,
+      h: 0.4,
+      min: false,
+      max: false,
+      z: 15,
+      norm: { x: 0.52, y: 0.48, w: 0.32, h: 0.4 },
+      opened: false,
+    },
+    config: {
+      x: 0.18,
+      y: 0.52,
+      w: 0.34,
+      h: 0.36,
+      min: false,
+      max: false,
+      z: 16,
+      norm: { x: 0.18, y: 0.52, w: 0.34, h: 0.36 },
+      opened: false,
+    },
+    logs: {
+      x: 0.48,
+      y: 0.52,
+      w: 0.34,
+      h: 0.36,
+      min: false,
+      max: false,
+      z: 17,
+      norm: { x: 0.48, y: 0.52, w: 0.34, h: 0.36 },
+      opened: false,
+    },
+  };
+}
+
+function loadWindowLayout() {
+  const base = defaultWindowLayout();
+  try {
+    const raw = localStorage.getItem(STORAGE_WINDOWS);
+    if (!raw) {
+      return base;
+    }
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") {
+      return base;
+    }
+    const merged = { ...base };
+    for (const id of WINDOW_IDS) {
+      if (parsed[id] && typeof parsed[id] === "object") {
+        merged[id] = { ...base[id], ...parsed[id] };
+        for (const k of ["x", "y", "w", "h", "z"]) {
+          if (typeof merged[id][k] !== "number" || Number.isNaN(merged[id][k])) {
+            merged[id][k] = base[id][k];
+          }
+        }
+        merged[id].min = Boolean(merged[id].min);
+        merged[id].max = Boolean(merged[id].max);
+        if (SECONDARY_IDS.includes(id)) {
+          if (typeof merged[id].opened !== "boolean") {
+            merged[id].opened = !merged[id].min;
+          }
+          merged[id].min = false;
+        }
+        if (merged[id].norm && typeof merged[id].norm === "object") {
+          const n = merged[id].norm;
+          for (const k of ["x", "y", "w", "h"]) {
+            if (typeof n[k] !== "number" || Number.isNaN(n[k])) {
+              merged[id].norm = base[id].norm ? { ...base[id].norm } : undefined;
+              break;
+            }
+          }
+        } else if (base[id].norm) {
+          merged[id].norm = { ...base[id].norm };
+        }
+      }
+    }
+    return merged;
+  } catch {
+    return base;
+  }
+}
+
+function saveWindowLayout() {
+  try {
+    localStorage.setItem(STORAGE_WINDOWS, JSON.stringify(windowLayout));
+  } catch {
+    /* ignore quota */
+  }
+}
+
+function scheduleCanvasResize() {
+  requestAnimationFrame(() => {
+    resizeCanvases();
+    renderMap();
+    renderCameraOverlay();
+  });
+}
+
+function bringWindowToFront(id) {
+  const L = windowLayout[id];
+  if (!L) {
+    return;
+  }
+  zCounter += 1;
+  L.z = zCounter;
+  const el = document.querySelector(`[data-window="${id}"]`);
+  if (el) {
+    el.style.zIndex = String(L.z);
+  }
+  saveWindowLayout();
+}
+
+function applyWindowLayout() {
+  WINDOW_IDS.forEach((id) => {
+    const el = document.querySelector(`[data-window="${id}"]`);
+    const L = windowLayout[id];
+    if (!el || !L) {
+      return;
+    }
+    if (SECONDARY_IDS.includes(id) && L.opened === false) {
+      el.classList.add("float-window--closed");
+      el.setAttribute("aria-hidden", "true");
+      return;
+    }
+    el.classList.remove("float-window--closed");
+    el.setAttribute("aria-hidden", "false");
+
+    el.classList.toggle("minimized", L.min);
+    el.classList.toggle("maximized", L.max);
+    el.style.zIndex = String(L.z || 10);
+
+    if (L.max) {
+      el.style.left = "6px";
+      el.style.top = "6px";
+      el.style.width = "calc(100% - 12px)";
+      el.style.height = "calc(100% - 12px)";
+      return;
+    }
+
+    el.style.left = `${L.x * 100}%`;
+    el.style.top = `${L.y * 100}%`;
+    el.style.width = `${L.w * 100}%`;
+    if (L.min) {
+      el.style.height = "auto";
+    } else {
+      el.style.height = `${L.h * 100}%`;
+    }
+  });
+  scheduleCanvasResize();
+}
+
+function toggleMinimize(id) {
+  const L = windowLayout[id];
+  if (!L) {
+    return;
+  }
+  if (SECONDARY_IDS.includes(id)) {
+    if (!L.opened) {
+      return;
+    }
+    if (L.max) {
+      const r = maxRestore[id];
+      if (r) {
+        L.x = r.x;
+        L.y = r.y;
+        L.w = r.w;
+        L.h = r.h;
+        L.max = false;
+        delete maxRestore[id];
+      }
+    }
+    L.norm = { x: L.x, y: L.y, w: L.w, h: L.h };
+    L.opened = false;
+    L.min = false;
+    L.max = false;
+    saveWindowLayout();
+    applyWindowLayout();
+    return;
+  }
+
+  if (L.min) {
+    L.min = false;
+    L.max = false;
+    if (L.norm) {
+      L.x = L.norm.x;
+      L.y = L.norm.y;
+      L.w = L.norm.w;
+      L.h = L.norm.h;
+    }
+  } else {
+    if (L.max) {
+      const r = maxRestore[id];
+      if (r) {
+        L.x = r.x;
+        L.y = r.y;
+        L.w = r.w;
+        L.h = r.h;
+        L.max = false;
+        delete maxRestore[id];
+      }
+    }
+    L.norm = { x: L.x, y: L.y, w: L.w, h: L.h };
+    L.min = true;
+    L.max = false;
+  }
+  saveWindowLayout();
+  applyWindowLayout();
+}
+
+function toggleMaximize(id) {
+  const L = windowLayout[id];
+  if (!L) {
+    return;
+  }
+  if (L.max) {
+    L.max = false;
+    const r = maxRestore[id];
+    if (r) {
+      L.x = r.x;
+      L.y = r.y;
+      L.w = r.w;
+      L.h = r.h;
+      delete maxRestore[id];
+    }
+    L.min = false;
+  } else {
+    maxRestore[id] = { x: L.x, y: L.y, w: L.w, h: L.h };
+    L.max = true;
+    L.min = false;
+  }
+  saveWindowLayout();
+  applyWindowLayout();
+}
+
+function restoreAndFocus(id) {
+  const L = windowLayout[id];
+  if (!L) {
+    return;
+  }
+  if (SECONDARY_IDS.includes(id)) {
+    L.opened = true;
+    if (L.norm) {
+      L.x = L.norm.x;
+      L.y = L.norm.y;
+      L.w = L.norm.w;
+      L.h = L.norm.h;
+    }
+  } else if (L.norm && L.min) {
+    L.x = L.norm.x;
+    L.y = L.norm.y;
+    L.w = L.norm.w;
+    L.h = L.norm.h;
+  }
+  L.min = false;
+  L.max = false;
+  bringWindowToFront(id);
+  saveWindowLayout();
+  applyWindowLayout();
+}
+
+function initFloatingWindows() {
+  windowLayout = loadWindowLayout();
+  zCounter = Math.max(
+    30,
+    ...WINDOW_IDS.map((id) => windowLayout[id]?.z || 0),
+  );
+  applyWindowLayout();
+
+  const workspace = document.getElementById("window-workspace");
+  if (!workspace) {
+    return;
+  }
+
+  workspace.querySelectorAll(".float-window").forEach((winEl) => {
+    winEl.addEventListener("pointerdown", () => {
+      const id = winEl.dataset.window;
+      if (id) {
+        bringWindowToFront(id);
+      }
+    });
+
+    const head = winEl.querySelector("[data-drag-handle]");
+    if (!head) {
+      return;
+    }
+
+    head.addEventListener("pointerdown", (e) => {
+      if (e.target.closest(".win-btn")) {
+        return;
+      }
+      const id = winEl.dataset.window;
+      if (!id || !windowLayout[id]) {
+        return;
+      }
+      bringWindowToFront(id);
+      const L = windowLayout[id];
+      if (L.max) {
+        toggleMaximize(id);
+      }
+      const rect = workspace.getBoundingClientRect();
+      dragState = {
+        id,
+        startX: e.clientX,
+        startY: e.clientY,
+        origX: L.x,
+        origY: L.y,
+        wsW: rect.width,
+        wsH: rect.height,
+      };
+      head.setPointerCapture(e.pointerId);
+    });
+
+    head.addEventListener("pointermove", (e) => {
+      if (!dragState || dragState.id !== winEl.dataset.window) {
+        return;
+      }
+      const L = windowLayout[dragState.id];
+      if (!L || L.max) {
+        return;
+      }
+      const rect = workspace.getBoundingClientRect();
+      const dx = (e.clientX - dragState.startX) / rect.width;
+      const dy = (e.clientY - dragState.startY) / rect.height;
+      let nx = dragState.origX + dx;
+      let ny = dragState.origY + dy;
+      const boxH = L.min ? 0.04 : L.h;
+      nx = clamp(nx, 0, Math.max(0, 1 - L.w));
+      ny = clamp(ny, 0, Math.max(0, 1 - boxH));
+      L.x = nx;
+      L.y = ny;
+      applyWindowLayout();
+    });
+
+    head.addEventListener("pointerup", (e) => {
+      if (dragState && dragState.id === winEl.dataset.window) {
+        saveWindowLayout();
+        dragState = null;
+      }
+      try {
+        head.releasePointerCapture(e.pointerId);
+      } catch {
+        /* ignore */
+      }
+    });
+
+    head.addEventListener("pointercancel", () => {
+      if (dragState && dragState.id === winEl.dataset.window) {
+        saveWindowLayout();
+        dragState = null;
+      }
+    });
+
+    winEl.querySelector(".win-min")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleMinimize(winEl.dataset.window);
+    });
+    winEl.querySelector(".win-max")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleMaximize(winEl.dataset.window);
+    });
+  });
+
+  document.querySelectorAll("[data-launch]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.dataset.launch;
+      if (id && WINDOW_IDS.includes(id)) {
+        restoreAndFocus(id);
+      }
+    });
+  });
+
+  document.getElementById("reset-windows-btn")?.addEventListener("click", () => {
+    windowLayout = defaultWindowLayout();
+    for (const k of Object.keys(maxRestore)) {
+      delete maxRestore[k];
+    }
+    saveWindowLayout();
+    applyWindowLayout();
+  });
+
+  if (typeof ResizeObserver !== "undefined") {
+    const ro = new ResizeObserver(() => {
+      scheduleCanvasResize();
+    });
+    ro.observe(workspace);
+  }
 }
 
 function bindEvents() {
-  elements.tabButtons.forEach((button) => {
-    button.addEventListener("click", () => activateTab(button.dataset.tab));
-  });
-
   elements.mapModeButtons.forEach((button) => {
     button.addEventListener("click", () => {
       dashboardState.mapMode = button.dataset.mapMode;
@@ -130,12 +529,9 @@ function bindEvents() {
     }
     await postJson("/command", { cmd: "goto", waypoint });
   });
-
   document.getElementById("reload-waypoints-button").addEventListener("click", refreshWaypoints);
   document.getElementById("refresh-config-button").addEventListener("click", refreshConfig);
   document.getElementById("save-config-button").addEventListener("click", saveConfig);
-  document.getElementById("foxglove-reload-button").addEventListener("click", reloadFoxgloveFrame);
-  document.getElementById("foxglove-open-button").addEventListener("click", openFoxgloveExternal);
   document.getElementById("stop-button").addEventListener("click", () => postJson("/command", { cmd: "stop" }));
   document.getElementById("arm-voice-start-button").addEventListener("click", startArmVoiceTest);
   document.getElementById("arm-voice-stop-button").addEventListener("click", stopArmVoiceTest);
@@ -148,14 +544,15 @@ function bindEvents() {
   });
 
   elements.teleopButtons.forEach((button) => {
-    const vector = teleopPreset(button.dataset.teleop);
+    const preset = button.dataset.teleop || button.getAttribute("data-teleop");
+    const vector = teleopPreset(preset);
     const start = () => startTeleopPulse(vector);
     const stop = () => stopTeleopPulse();
     button.addEventListener("mousedown", start);
     button.addEventListener("mouseup", stop);
     button.addEventListener("mouseleave", stop);
-    button.addEventListener("touchstart", (event) => {
-      event.preventDefault();
+    button.addEventListener("touchstart", (e) => {
+      e.preventDefault();
       start();
     }, { passive: false });
     button.addEventListener("touchend", stop);
@@ -181,7 +578,14 @@ function connectWebSocket() {
   ws.addEventListener("message", (event) => {
     try {
       const message = JSON.parse(event.data);
-      handleMessage(message);
+      if (message.type !== "snapshot") {
+        return;
+      }
+      dashboardState.snapshot = message.data;
+      dashboardState.visibleLogs = Array.isArray(message.data.logs)
+        ? message.data.logs.slice(-MAX_LOGS)
+        : [];
+      renderAll();
     } catch (error) {
       console.error("Invalid WebSocket payload", error);
     }
@@ -192,31 +596,19 @@ function connectWebSocket() {
   });
 }
 
-function handleMessage(message) {
-  if (message.type !== "snapshot") {
-    return;
-  }
-  dashboardState.snapshot = message.data;
-  dashboardState.visibleLogs = Array.isArray(message.data.logs) ? message.data.logs.slice(-MAX_LOGS) : [];
-  renderAll();
-}
-
 function renderAll() {
   renderMeta();
-  renderSubsystems();
-  renderModules();
   renderTelemetry();
-  renderWaypoints();
-  renderGoal();
-  renderArmVoice();
-  renderPickup();
+  renderSubsystems();
   renderObstacles();
   renderLandmarks();
   renderVoice();
-  renderLogs();
+  renderGoal();
+  renderArmVoice();
+  renderPickup();
   renderConfig();
+  renderLogs();
   renderMap();
-  renderFoxglove();
   renderCameraOverlay();
 }
 
@@ -226,66 +618,11 @@ function renderMeta() {
     return;
   }
   const meta = snapshot.meta || {};
-  const breadcrumbs = meta.breadcrumbs || ["Wheelchair", "main"];
-  elements["breadcrumb-root"].textContent = breadcrumbs[0] || "Wheelchair";
-  elements["breadcrumb-leaf"].textContent = breadcrumbs[1] || "main";
-  elements["robot-name"].textContent = meta.robot_name || "Autonomous Wheelchair";
-  elements["sidebar-robot-name"].textContent = meta.robot_name || "Autonomous Wheelchair";
+  elements["robot-name"].textContent = meta.robot_name || "Wheelchair";
   elements["snapshot-rate"].textContent = `${formatNumber(meta.snapshot_rate_hz || 0, 0)} Hz`;
-
   const live = Boolean(meta.live);
   const label = meta.connection_label || (live ? "Live" : "Offline");
   setPillState(elements["connection-pill"], live ? "status-live" : "status-offline", label);
-  setPillState(elements["sidebar-live-pill"], live ? "status-live" : "status-offline", label);
-  elements["robot-dot"].classList.toggle("live", live);
-  elements["robot-status-text"].textContent = live
-    ? "Serial connected and telemetry streaming"
-    : "Waiting for live robot connection";
-}
-
-function renderSubsystems() {
-  const snapshot = dashboardState.snapshot;
-  const container = elements["subsystems-tree"];
-  if (!snapshot) {
-    return;
-  }
-  const subsystems = snapshot.subsystems || {};
-  const markup = Object.entries(subsystems).map(([name, subsystem]) => {
-    const statusClass = statusClassFor(subsystem.status);
-    return `
-      <div class="tree-item">
-        <span class="tree-icon">${escapeHtml(subsystem.icon || name.slice(0, 2).toUpperCase())}</span>
-        <div>
-          <div class="tree-title">${escapeHtml(name)}</div>
-          <div class="tree-detail">${escapeHtml(subsystem.detail || "No detail")}</div>
-        </div>
-        <span class="status-pill ${statusClass}">${escapeHtml(humanizeStatus(subsystem.status))}</span>
-      </div>
-    `;
-  }).join("");
-  container.innerHTML = markup || emptyState("No subsystems reported.");
-}
-
-function renderModules() {
-  const snapshot = dashboardState.snapshot;
-  const container = elements["modules-list"];
-  if (!snapshot) {
-    return;
-  }
-  const modules = snapshot.modules || [];
-  const markup = modules.map((module) => `
-    <div class="module-item">
-      <div>
-        <div class="tree-title">${escapeHtml(module.name)}</div>
-        <div class="tree-detail">${escapeHtml(humanizeStatus(module.status))}</div>
-      </div>
-      <div class="module-status">
-        <span class="module-status-dot ${module.connected ? "connected" : "idle"}"></span>
-        <span class="status-pill ${statusClassFor(module.status)}">${module.connected ? "Active" : "Idle"}</span>
-      </div>
-    </div>
-  `).join("");
-  container.innerHTML = markup || emptyState("No active modules.");
 }
 
 function renderTelemetry() {
@@ -297,125 +634,52 @@ function renderTelemetry() {
   const velocity = snapshot.velocity || {};
   const nav = snapshot.nav_state || {};
   const imu = snapshot.imu || {};
-
-  elements["pose-x"].textContent = `${formatNumber(pose.x)} m`;
-  elements["pose-y"].textContent = `${formatNumber(pose.y)} m`;
-  elements["pose-theta"].textContent = `${formatNumber(pose.theta)} rad`;
-  elements["pose-frame"].textContent = pose.frame || "world";
-  const covariance = Array.isArray(pose.covariance) ? pose.covariance : null;
-  elements["pose-cov-xy"].textContent = covariance ? formatNumber(covariance[0]?.[0] ?? 0) : "n/a";
-  elements["pose-cov-theta"].textContent = covariance ? formatNumber(covariance[2]?.[2] ?? 0) : "n/a";
-  elements["vel-vx"].textContent = `${formatNumber(velocity.vx)} m/s`;
-  elements["vel-vy"].textContent = `${formatNumber(velocity.vy)} m/s`;
-  elements["vel-omega"].textContent = `${formatNumber(velocity.omega)} rad/s`;
-  elements["nav-mode"].textContent = nav.mode || "manual";
-  elements["nav-state"].textContent = nav.state || "Idle";
+  elements["pose-xyz"].textContent = `${formatNumber(pose.x)}, ${formatNumber(pose.y)}, ${formatNumber(pose.theta)}`;
+  elements["pose-vel-line"].textContent = `${formatNumber(velocity.vx)}, ${formatNumber(velocity.vy)}, ${formatNumber(velocity.omega)}`;
+  elements["nav-line"].textContent = `${nav.state || "Idle"} · ${nav.mode || "manual"}`;
   elements["nav-estop"].textContent = nav.estop ? "ACTIVE" : "Clear";
-  elements["imu-status"].textContent = imu.receiving ? "receiving" : "idle";
   elements["imu-gyro-z"].textContent = `${formatNumber(imu.gyro_z)} rad/s`;
-  elements["imu-age"].textContent = imu.packet_age_s == null ? "n/a" : `${formatNumber(imu.packet_age_s)} s`;
 }
 
-function renderWaypoints() {
+function renderSubsystems() {
   const snapshot = dashboardState.snapshot;
-  const select = elements["waypoint-select"];
-  if (!snapshot || !select) {
+  const container = elements["subsystems-tree"];
+  if (!snapshot || !container) {
     return;
   }
-  const waypoints = snapshot.waypoints || {};
-  const current = select.value;
-  select.innerHTML = Object.entries(waypoints).map(([name, coords]) =>
-    `<option value="${escapeAttribute(name)}">${escapeHtml(name)} (${formatNumber(coords[0])}, ${formatNumber(coords[1])})</option>`
-  ).join("");
-  if (current && waypoints[current]) {
-    select.value = current;
-  }
-}
-
-function renderGoal() {
-  const snapshot = dashboardState.snapshot;
-  if (!snapshot) {
-    return;
-  }
-  const goal = snapshot.goal;
-  const nav = snapshot.nav_state || {};
-  const meta = snapshot.meta || {};
-  if (!goal) {
-    elements["goal-summary"].textContent = "No active goal.";
-  } else {
-    const label = goal.label ? `${goal.label} ` : "";
-    elements["goal-summary"].textContent = `${label}x ${formatNumber(goal.x)} | y ${formatNumber(goal.y)} | state ${nav.state || "Idle"}`;
-  }
-  elements["command-queue-note"].textContent = `Queued for controller: ${meta.pending_commands || 0} commands | ${meta.pending_landmarks || 0} landmark requests.`;
-}
-
-function renderArmVoice() {
-  const snapshot = dashboardState.snapshot;
-  if (!snapshot) {
-    return;
-  }
-  const armVoice = snapshot.arm_voice || {};
-  const status = armVoice.status || "idle";
-  const running = Boolean(armVoice.running);
-  const detail = armVoice.detail || "Press Start to run the arm voice script.";
-
-  setPillState(elements["arm-voice-pill"], statusClassFor(status), humanizeStatus(status));
-  elements["arm-voice-detail"].textContent = detail;
-  elements["arm-voice-start-button"].disabled = running || status === "starting";
-  elements["arm-voice-stop-button"].disabled = !(running || status === "starting" || status === "stopping");
-}
-
-function renderPickup() {
-  const snapshot = dashboardState.snapshot;
-  if (!snapshot) {
-    return;
-  }
-
-  const pickup = snapshot.pickup || {};
-  const detection = pickup.last_detection || null;
-  const target = pickup.last_target || null;
-  const status = pickup.status || "idle";
-  const running = Boolean(pickup.running);
-
-  setPillState(elements["pickup-pill"], statusClassFor(status), humanizeStatus(status));
-  elements["pickup-detail"].textContent = pickup.detail || "Pickup controller idle.";
-  elements["pickup-refresh-button"].disabled = running;
-  elements["pickup-start-button"].disabled = running;
-  elements["pickup-stop-button"].disabled = !running;
-  elements["pickup-label"].textContent = detection && detection.label ? detection.label : "n/a";
-  elements["pickup-confidence"].textContent = detection
-    ? `${Math.round((Number(detection.confidence) || 0) * 100)}%`
-    : "n/a";
-  elements["pickup-range"].textContent = target && target.range_m != null
-    ? `${formatNumber(target.range_m)} m`
-    : "n/a";
-  elements["pickup-lateral"].textContent = target && target.lateral_m != null
-    ? `${formatNumber(target.lateral_m)} m`
-    : "n/a";
-  elements["pickup-zone"].textContent = !target
-    ? "No target"
-    : target.in_pickup_zone
-      ? (target.centered ? "Ready" : "Off center")
-      : "Outside zone";
-  elements["pickup-attempts"].textContent = String(pickup.attempts || 0);
+  const subsystems = snapshot.subsystems || {};
+  const markup = Object.entries(subsystems).map(([name, subsystem]) => {
+    const statusClass = statusClassFor(subsystem.status);
+    return `
+      <div class="tree-item">
+        <span class="tree-icon">${escapeHtml(subsystem.icon || name.slice(0, 2).toUpperCase())}</span>
+        <div>
+          <div class="tree-title">${escapeHtml(name)}</div>
+          <div class="tree-detail">${escapeHtml(subsystem.detail || "")}</div>
+        </div>
+        <span class="status-pill ${statusClass}">${escapeHtml(humanizeStatus(subsystem.status))}</span>
+      </div>
+    `;
+  }).join("");
+  container.innerHTML = markup || emptyState("No subsystems.");
 }
 
 function renderObstacles() {
   const snapshot = dashboardState.snapshot;
   const container = elements["obstacles-list"];
-  if (!snapshot) {
+  if (!snapshot || !container) {
     return;
   }
   const obstacles = snapshot.obstacles || [];
   if (!obstacles.length) {
-    container.innerHTML = emptyState("No obstacles detected.");
+    container.innerHTML = emptyState("None.");
     return;
   }
   container.innerHTML = obstacles.map((obstacle) => `
     <div class="list-item">
       <div>
         <div class="list-title">Obstacle</div>
-        <div class="list-detail">dist ${formatNumber(obstacle.distance_m)} m | angle ${formatNumber(obstacle.angle_deg)} deg</div>
+        <div class="list-detail">${formatNumber(obstacle.distance_m)} m · ${formatNumber(obstacle.angle_deg)}°</div>
       </div>
       <div class="list-metric">${Math.round((obstacle.confidence || 0) * 100)}%</div>
     </div>
@@ -425,21 +689,21 @@ function renderObstacles() {
 function renderLandmarks() {
   const snapshot = dashboardState.snapshot;
   const container = elements["landmarks-list"];
-  if (!snapshot) {
+  if (!snapshot || !container) {
     return;
   }
   const landmarks = snapshot.landmarks || [];
   if (!landmarks.length) {
-    container.innerHTML = emptyState("No landmarks registered.");
+    container.innerHTML = emptyState("None.");
     return;
   }
   container.innerHTML = landmarks.map((landmark) => `
     <div class="list-item">
       <div>
-        <div class="list-title">${escapeHtml(landmark.name || "landmark")}</div>
-        <div class="list-detail">x ${formatNumber(landmark.x)} | y ${formatNumber(landmark.y)} | ${escapeHtml(landmark.source || "map")} | ${Math.round((landmark.confidence || 0) * 100)}%</div>
+        <div class="list-title">${escapeHtml(landmark.name || "—")}</div>
+        <div class="list-detail">${formatNumber(landmark.x)}, ${formatNumber(landmark.y)}</div>
       </div>
-      <div class="list-metric">${escapeHtml((landmark.descriptor_status || "unknown").replaceAll("_", " "))}</div>
+      <div class="list-metric">${Math.round((landmark.confidence || 0) * 100)}%</div>
     </div>
   `).join("");
 }
@@ -450,163 +714,96 @@ function renderVoice() {
     return;
   }
   const voice = snapshot.voice || {};
-  elements["voice-transcript"].textContent = voice.transcript || "Waiting for command...";
-  elements["voice-response"].textContent = voice.response || "No response yet.";
+  elements["voice-transcript"].textContent = voice.transcript || "—";
+  elements["voice-response"].textContent = voice.response || "—";
 }
 
-function renderFoxglove() {
+function renderGoal() {
   const snapshot = dashboardState.snapshot;
   if (!snapshot) {
     return;
   }
-
-  const foxglove = snapshot.foxglove || {};
-  const available = Boolean(foxglove.available);
-  const status = foxglove.status || "disconnected";
-  const bridgeUrl = buildFoxgloveWsUrl(foxglove);
-  const embedUrl = buildFoxgloveEmbedUrl(foxglove, bridgeUrl);
-  const frame = elements["foxglove-frame"];
-  dashboardState.foxgloveEmbedUrl = embedUrl;
-
-  elements["foxglove-ws-url"].textContent = bridgeUrl;
-  setPillState(elements["foxglove-status-pill"], statusClassFor(status), humanizeStatus(status));
-
-  let note = foxglove.detail || "Foxglove bridge status unknown.";
-  if (!available && foxglove.install_command) {
-    note = `${note} Install with: ${foxglove.install_command}`;
-  }
-  elements["foxglove-note"].textContent = note;
-
-  if (available) {
-    if (frame.dataset.loadedSrc !== embedUrl) {
-      frame.src = embedUrl;
-      frame.dataset.loadedSrc = embedUrl;
-    }
-  } else if (frame.dataset.loadedSrc) {
-    frame.removeAttribute("src");
-    frame.dataset.loadedSrc = "";
+  const goal = snapshot.goal;
+  const nav = snapshot.nav_state || {};
+  const meta = snapshot.meta || {};
+  const q = `${meta.pending_commands || 0} cmd · ${meta.pending_landmarks || 0} lm`;
+  if (!goal) {
+    elements["goal-summary"].textContent = `No goal · ${q}`;
+  } else {
+    const label = goal.label ? `${goal.label} · ` : "";
+    elements["goal-summary"].textContent = `${label}${formatNumber(goal.x)}, ${formatNumber(goal.y)} · ${nav.state || "Idle"} · ${q}`;
   }
 }
 
-function renderLogs() {
-  const container = elements["log-viewer"];
-  const logs = dashboardState.visibleLogs || [];
-  if (!logs.length) {
-    container.innerHTML = emptyState("No log messages yet.");
+function renderArmVoice() {
+  const snapshot = dashboardState.snapshot;
+  if (!snapshot) {
     return;
   }
-  const nearBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - 24;
-  container.innerHTML = logs.map((entry) => `
-    <div class="log-entry">
-      <span>${escapeHtml(entry.ts || "")}</span>
-      <span class="log-level" style="color:${escapeAttribute(entry.color || "#1f6feb")}">${escapeHtml(entry.level || "INFO")}</span>
-      <span>${escapeHtml(entry.source || "system")}</span>
-      <span>${escapeHtml(entry.message || "")}</span>
-    </div>
-  `).join("");
-  if (nearBottom) {
-    container.scrollTop = container.scrollHeight;
-  }
+  const armVoice = snapshot.arm_voice || {};
+  const status = armVoice.status || "idle";
+  const running = Boolean(armVoice.running);
+  setPillState(elements["arm-voice-pill"], statusClassFor(status), humanizeStatus(status));
+  elements["arm-voice-detail"].textContent = armVoice.detail || "Start, then speak.";
+  elements["arm-voice-start-button"].disabled = running || status === "starting";
+  elements["arm-voice-stop-button"].disabled = !(running || status === "starting" || status === "stopping");
 }
 
-async function startArmVoiceTest() {
-  elements["arm-voice-detail"].textContent = "Starting arm voice test...";
-  try {
-    await postJson("/arm/voice", { action: "start", mode: "local_fake" });
-  } catch (error) {
-    console.error("Failed to start arm voice test", error);
-    setPillState(elements["arm-voice-pill"], "status-error", "Error");
-    elements["arm-voice-detail"].textContent = String(error.message || error);
+function renderPickup() {
+  const snapshot = dashboardState.snapshot;
+  if (!snapshot) {
+    return;
   }
-}
-
-async function stopArmVoiceTest() {
-  elements["arm-voice-detail"].textContent = "Stopping arm voice test...";
-  try {
-    await postJson("/arm/voice", { action: "stop" });
-  } catch (error) {
-    console.error("Failed to stop arm voice test", error);
-    setPillState(elements["arm-voice-pill"], "status-error", "Error");
-    elements["arm-voice-detail"].textContent = String(error.message || error);
-  }
-}
-
-async function refreshPickupDetection() {
-  elements["pickup-detail"].textContent = "Refreshing VIAM pickup detection...";
-  try {
-    await postJson("/pickup", { action: "refresh" });
-  } catch (error) {
-    console.error("Failed to refresh pickup detection", error);
-    setPillState(elements["pickup-pill"], "status-error", "Error");
-    elements["pickup-detail"].textContent = String(error.message || error);
-  }
-}
-
-async function startPickup() {
-  elements["pickup-detail"].textContent = "Starting pickup sequence...";
-  try {
-    await postJson("/pickup", { action: "start" });
-  } catch (error) {
-    console.error("Failed to start pickup", error);
-    setPillState(elements["pickup-pill"], "status-error", "Error");
-    elements["pickup-detail"].textContent = String(error.message || error);
-  }
-}
-
-async function stopPickup() {
-  elements["pickup-detail"].textContent = "Stopping pickup sequence...";
-  try {
-    await postJson("/pickup", { action: "stop" });
-  } catch (error) {
-    console.error("Failed to stop pickup", error);
-    setPillState(elements["pickup-pill"], "status-error", "Error");
-    elements["pickup-detail"].textContent = String(error.message || error);
-  }
+  const pickup = snapshot.pickup || {};
+  const status = pickup.status || "idle";
+  const running = Boolean(pickup.running);
+  setPillState(elements["pickup-pill"], statusClassFor(status), humanizeStatus(status));
+  elements["pickup-detail"].textContent = pickup.detail || "—";
+  elements["pickup-refresh-button"].disabled = running;
+  elements["pickup-start-button"].disabled = running;
+  elements["pickup-stop-button"].disabled = !running;
 }
 
 function renderConfig() {
   const snapshot = dashboardState.snapshot;
   const container = elements["config-form"];
-  if (!snapshot) {
+  if (!snapshot || !container) {
     return;
   }
   const config = snapshot.config || {};
   const configMeta = snapshot.config_meta || {};
   if (elements["config-note"]) {
-    elements["config-note"].textContent = configMeta.save_note || "Saving updates the dashboard snapshot only.";
+    elements["config-note"].textContent = configMeta.save_note || "";
   }
   const hash = JSON.stringify(config);
   if (hash === dashboardState.configRenderedHash) {
     return;
   }
   dashboardState.configRenderedHash = hash;
-
   const preferredOrder = ["serial", "lidar", "slam", "planner", "safety", "camera", "pickup", "ekf", "phone_imu"];
   const sections = Object.keys(config).sort((a, b) => {
-    const aIdx = preferredOrder.indexOf(a);
-    const bIdx = preferredOrder.indexOf(b);
-    if (aIdx === -1 && bIdx === -1) {
+    const ai = preferredOrder.indexOf(a);
+    const bi = preferredOrder.indexOf(b);
+    if (ai === -1 && bi === -1) {
       return a.localeCompare(b);
     }
-    if (aIdx === -1) {
+    if (ai === -1) {
       return 1;
     }
-    if (bIdx === -1) {
+    if (bi === -1) {
       return -1;
     }
-    return aIdx - bIdx;
+    return ai - bi;
   });
-  container.innerHTML = sections.map((sectionName) => renderConfigSection(sectionName, config[sectionName] || {})).join("");
+  container.innerHTML = sections.map((name) => renderConfigSection(name, config[name] || {})).join("");
 }
 
 function renderConfigSection(sectionName, sectionConfig) {
   const fields = Object.entries(sectionConfig).map(([key, value]) => {
     const label = `
-      <div class="config-label-row">
-        <div>
-          <div class="config-key">${escapeHtml(key)}</div>
-          <div class="config-helper">${escapeHtml(sectionName)}</div>
-        </div>
+      <div>
+        <div class="config-key">${escapeHtml(key)}</div>
+        <div class="config-helper">${escapeHtml(sectionName)}</div>
       </div>
     `;
     if (typeof value === "boolean") {
@@ -618,7 +815,7 @@ function renderConfigSection(sectionName, sectionConfig) {
               <input type="checkbox" class="config-toggle" ${value ? "checked" : ""} />
               <span class="switch-slider"></span>
             </label>
-            <span>${value ? "Enabled" : "Disabled"}</span>
+            <span>${value ? "On" : "Off"}</span>
           </div>
         </div>
       `;
@@ -634,15 +831,31 @@ function renderConfigSection(sectionName, sectionConfig) {
 
   return `
     <section class="config-section">
-      <div class="config-section-header">
-        <div>
-          <div class="section-title">${escapeHtml(capitalize(sectionName))}</div>
-          <div class="section-subtitle">Live runtime parameters</div>
-        </div>
-      </div>
+      <div class="config-section-header">${escapeHtml(capitalize(sectionName))}</div>
       <div class="config-section-body">${fields || emptyState("No fields")}</div>
     </section>
   `;
+}
+
+function renderLogs() {
+  const container = elements["log-viewer"];
+  const logs = dashboardState.visibleLogs || [];
+  if (!logs.length) {
+    container.innerHTML = emptyState("No logs yet.");
+    return;
+  }
+  const nearBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - 24;
+  container.innerHTML = logs.map((entry) => `
+    <div class="log-entry">
+      <span>${escapeHtml(entry.ts || "")}</span>
+      <span class="log-level" style="color:${escapeAttribute(entry.color || "#60a5fa")}">${escapeHtml(entry.level || "INFO")}</span>
+      <span>${escapeHtml(entry.source || "")}</span>
+      <span>${escapeHtml(entry.message || "")}</span>
+    </div>
+  `).join("");
+  if (nearBottom) {
+    container.scrollTop = container.scrollHeight;
+  }
 }
 
 function renderMap() {
@@ -655,15 +868,15 @@ function renderMap() {
   const width = canvas.clientWidth || canvas.width;
   const height = canvas.clientHeight || canvas.height;
   ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = "#f8fafc";
+  ctx.fillStyle = "#0b0d10";
   ctx.fillRect(0, 0, width, height);
 
   const map = snapshot.occupancy_grid || {};
   drawOccupancyGrid(ctx, canvas, map);
   drawPath(ctx, canvas, map, snapshot.path || []);
   drawLidar(ctx, canvas, map, snapshot.pose || {}, snapshot.lidar_scan || {});
-  drawObstacles(ctx, canvas, map, snapshot.pose || {}, snapshot.obstacles || []);
-  drawLandmarks(ctx, canvas, map, snapshot.pose || {}, snapshot.landmarks || []);
+  drawObstaclesMap(ctx, canvas, map, snapshot.pose || {}, snapshot.obstacles || []);
+  drawLandmarksMap(ctx, canvas, map, snapshot.pose || {}, snapshot.landmarks || []);
   drawGoal(ctx, canvas, map, snapshot.goal);
   drawRobot(ctx, canvas, map, snapshot.pose || {});
 }
@@ -677,11 +890,10 @@ function drawOccupancyGrid(ctx, canvas, map) {
   const cols = grid[0].length;
   const cellWidth = (canvas.clientWidth || canvas.width) / cols;
   const cellHeight = (canvas.clientHeight || canvas.height) / rows;
-
   for (let row = 0; row < rows; row += 1) {
     for (let col = 0; col < cols; col += 1) {
       const value = Number(grid[row][col]);
-      const shade = Math.max(110, Math.min(248, Math.round(252 - value * 160)));
+      const shade = Math.max(60, Math.min(220, Math.round(200 - value * 140)));
       ctx.fillStyle = `rgb(${shade}, ${shade}, ${shade})`;
       ctx.fillRect(col * cellWidth, row * cellHeight, cellWidth + 1, cellHeight + 1);
     }
@@ -693,7 +905,7 @@ function drawPath(ctx, canvas, map, path) {
     return;
   }
   ctx.save();
-  ctx.strokeStyle = "#1f6feb";
+  ctx.strokeStyle = "#60a5fa";
   ctx.lineWidth = 3;
   ctx.beginPath();
   path.forEach((point, index) => {
@@ -714,7 +926,7 @@ function drawLidar(ctx, canvas, map, pose, lidarScan) {
     return;
   }
   ctx.save();
-  ctx.fillStyle = "rgba(40, 167, 69, 0.9)";
+  ctx.fillStyle = "rgba(61, 214, 140, 0.9)";
   points.forEach((point) => {
     const worldPoint = robotToWorld(point.x, point.y, pose);
     const pixel = worldToCanvas(worldPoint.x, worldPoint.y, map, canvas);
@@ -725,14 +937,13 @@ function drawLidar(ctx, canvas, map, pose, lidarScan) {
   ctx.restore();
 }
 
-function drawObstacles(ctx, canvas, map, pose, obstacles) {
+function drawObstaclesMap(ctx, canvas, map, pose, obstacles) {
   if (!obstacles.length) {
     return;
   }
   ctx.save();
-  ctx.strokeStyle = "#d1242f";
-  ctx.lineWidth = 2;
-  ctx.fillStyle = "rgba(209, 36, 47, 0.08)";
+  ctx.strokeStyle = "#f87171";
+  ctx.fillStyle = "rgba(248, 113, 113, 0.12)";
   obstacles.forEach((obstacle) => {
     const worldPoint = robotToWorld(obstacle.x, obstacle.y, pose);
     const pixel = worldToCanvas(worldPoint.x, worldPoint.y, map, canvas);
@@ -745,26 +956,25 @@ function drawObstacles(ctx, canvas, map, pose, obstacles) {
   ctx.restore();
 }
 
-function drawLandmarks(ctx, canvas, map, pose, landmarks) {
+function drawLandmarksMap(ctx, canvas, map, pose, landmarks) {
   if (!landmarks.length) {
     return;
   }
   ctx.save();
-  ctx.fillStyle = "#111111";
-  ctx.strokeStyle = "#111111";
-  ctx.font = "12px Inter, system-ui, sans-serif";
+  ctx.fillStyle = "#e8eaed";
+  ctx.font = "11px Inter, system-ui, sans-serif";
   landmarks.forEach((landmark) => {
     const point = landmark.frame === "robot"
       ? robotToWorld(landmark.x, landmark.y, pose)
       : { x: landmark.x, y: landmark.y };
     const pixel = worldToCanvas(point.x, point.y, map, canvas);
     ctx.beginPath();
-    ctx.moveTo(pixel.x, pixel.y - 10);
-    ctx.lineTo(pixel.x - 7, pixel.y + 6);
-    ctx.lineTo(pixel.x + 7, pixel.y + 6);
+    ctx.moveTo(pixel.x, pixel.y - 8);
+    ctx.lineTo(pixel.x - 6, pixel.y + 5);
+    ctx.lineTo(pixel.x + 6, pixel.y + 5);
     ctx.closePath();
     ctx.fill();
-    ctx.fillText(landmark.name || "landmark", pixel.x + 10, pixel.y + 2);
+    ctx.fillText(landmark.name || "", pixel.x + 8, pixel.y + 2);
   });
   ctx.restore();
 }
@@ -775,7 +985,7 @@ function drawGoal(ctx, canvas, map, goal) {
   }
   const pixel = worldToCanvas(goal.x, goal.y, map, canvas);
   ctx.save();
-  ctx.strokeStyle = "#1f6feb";
+  ctx.strokeStyle = "#38bdf8";
   ctx.lineWidth = 3;
   ctx.beginPath();
   ctx.arc(pixel.x, pixel.y, 10, 0, Math.PI * 2);
@@ -795,7 +1005,7 @@ function drawRobot(ctx, canvas, map, pose) {
   ctx.save();
   ctx.translate(pixel.x, pixel.y);
   ctx.rotate(-theta);
-  ctx.fillStyle = "#111111";
+  ctx.fillStyle = "#e8eaed";
   ctx.beginPath();
   ctx.moveTo(16, 0);
   ctx.lineTo(-12, -10);
@@ -815,10 +1025,8 @@ function setupMapInteractions() {
     }
     const map = snapshot.occupancy_grid || {};
     const rect = canvas.getBoundingClientRect();
-    const x = event.clientX - rect.left;
-    const y = event.clientY - rect.top;
-    const world = canvasToWorld(x, y, map, canvas);
-    elements["map-cursor-coords"].textContent = `x ${formatNumber(world.x)} | y ${formatNumber(world.y)}`;
+    const world = canvasToWorld(event.clientX - rect.left, event.clientY - rect.top, map, canvas);
+    elements["map-cursor-coords"].textContent = `x ${formatNumber(world.x)} · y ${formatNumber(world.y)}`;
   });
 
   canvas.addEventListener("click", async (event) => {
@@ -836,7 +1044,14 @@ function setupMapInteractions() {
       if (!name) {
         return;
       }
-      await postJson("/landmark", { name, x: world.x, y: world.y, frame: "world", source: "map", descriptor_status: "pending_capture" });
+      await postJson("/landmark", {
+        name,
+        x: world.x,
+        y: world.y,
+        frame: "world",
+        source: "map",
+        descriptor_status: "pending_capture",
+      });
     }
   });
 
@@ -860,10 +1075,10 @@ function renderCameraOverlay() {
   const ctx = overlay.getContext("2d");
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, width, height);
-  ctx.strokeStyle = "#28a745";
-  ctx.fillStyle = "#28a745";
+  ctx.strokeStyle = "#3dd68c";
+  ctx.fillStyle = "#3dd68c";
   ctx.lineWidth = 2;
-  ctx.font = "12px Inter, system-ui, sans-serif";
+  ctx.font = "11px Inter, system-ui, sans-serif";
 
   const obstacles = snapshot.obstacles || [];
   obstacles.forEach((obstacle, index) => {
@@ -884,7 +1099,6 @@ function renderCameraOverlay() {
   if (!detection || !detection.image_width || !detection.image_height) {
     return;
   }
-
   const scaleX = width / Number(detection.image_width || width);
   const scaleY = height / Number(detection.image_height || height);
   const x = Number(detection.x_min || 0) * scaleX;
@@ -894,8 +1108,7 @@ function renderCameraOverlay() {
   const centerX = x + boxWidth / 2;
   const centerY = y + boxHeight / 2;
   const ready = pickup.status === "ready" || pickup.status === "success";
-  const stroke = ready ? "#1f6feb" : "#f59e0b";
-
+  const stroke = ready ? "#60a5fa" : "#fbbf24";
   ctx.save();
   ctx.strokeStyle = stroke;
   ctx.fillStyle = stroke;
@@ -912,44 +1125,41 @@ function renderCameraOverlay() {
   ctx.stroke();
   const label = detection.label || "ball";
   const confidence = `${Math.round((Number(detection.confidence) || 0) * 100)}%`;
-  const rangeText = target && target.range_m != null ? `${formatNumber(target.range_m)}m` : "range n/a";
-  ctx.fillText(`${label} ${confidence} | ${rangeText}`, x, Math.max(16, y - 8));
+  const rangeText = target && target.range_m != null ? `${formatNumber(target.range_m)}m` : "n/a";
+  ctx.fillText(`${label} ${confidence} · ${rangeText}`, x, Math.max(16, y - 8));
   ctx.restore();
 }
 
 function setupJoystick() {
   const pad = elements["joystick-pad"];
   const knob = elements["joystick-knob"];
-
   const updateJoystick = (clientX, clientY) => {
     const rect = pad.getBoundingClientRect();
     const centerX = rect.left + rect.width / 2;
     const centerY = rect.top + rect.height / 2;
-    const radius = rect.width / 2 - 32;
+    const radius = rect.width / 2 - 22;
     let dx = clientX - centerX;
     let dy = clientY - centerY;
-    const distance = Math.hypot(dx, dy);
-    if (distance > radius) {
-      dx = (dx / distance) * radius;
-      dy = (dy / distance) * radius;
+    const dist = Math.hypot(dx, dy);
+    if (dist > radius) {
+      dx = (dx / dist) * radius;
+      dy = (dy / dist) * radius;
     }
     knob.style.transform = `translate(${dx}px, ${dy}px)`;
     dashboardState.joystick.vx = Number((-dy / radius) * 0.5);
     dashboardState.joystick.vy = Number((dx / radius) * 0.25);
-    elements["joystick-readout"].textContent = `vx ${formatNumber(dashboardState.joystick.vx)} | vy ${formatNumber(dashboardState.joystick.vy)}`;
+    elements["joystick-readout"].textContent = `vx ${formatNumber(dashboardState.joystick.vx)} · vy ${formatNumber(dashboardState.joystick.vy)}`;
   };
-
   const resetJoystick = () => {
     dashboardState.joystick.active = false;
     dashboardState.joystick.pointerId = null;
     dashboardState.joystick.vx = 0;
     dashboardState.joystick.vy = 0;
     knob.style.transform = "translate(0px, 0px)";
-    elements["joystick-readout"].textContent = "vx 0.00 | vy 0.00";
+    elements["joystick-readout"].textContent = "vx 0 · vy 0";
     stopJoystickPulse();
-    postJson("/command", { cmd: "teleop", vx: 0, vy: 0, omega: 0 });
+    postJson("/command", { cmd: "teleop", vx: 0, vy: 0, omega: 0 }).catch(() => {});
   };
-
   pad.addEventListener("pointerdown", (event) => {
     dashboardState.joystick.active = true;
     dashboardState.joystick.pointerId = event.pointerId;
@@ -957,14 +1167,12 @@ function setupJoystick() {
     updateJoystick(event.clientX, event.clientY);
     startJoystickPulse();
   });
-
   pad.addEventListener("pointermove", (event) => {
     if (!dashboardState.joystick.active || dashboardState.joystick.pointerId !== event.pointerId) {
       return;
     }
     updateJoystick(event.clientX, event.clientY);
   });
-
   ["pointerup", "pointercancel", "lostpointercapture"].forEach((eventName) => {
     pad.addEventListener(eventName, resetJoystick);
   });
@@ -987,7 +1195,6 @@ function stopJoystickPulse() {
 
 function setupKeyboardTeleop() {
   const pressed = new Set();
-
   const updateVector = () => {
     const vx = (pressed.has("w") ? 0.45 : 0) + (pressed.has("s") ? -0.45 : 0);
     const vy = (pressed.has("a") ? 0.22 : 0) + (pressed.has("d") ? -0.22 : 0);
@@ -1005,7 +1212,6 @@ function setupKeyboardTeleop() {
       sendTeleop(0, 0, 0);
     }
   };
-
   window.addEventListener("keydown", (event) => {
     const key = event.key.toLowerCase();
     if (!["w", "a", "s", "d"].includes(key)) {
@@ -1014,7 +1220,6 @@ function setupKeyboardTeleop() {
     pressed.add(key);
     updateVector();
   });
-
   window.addEventListener("keyup", (event) => {
     const key = event.key.toLowerCase();
     if (!["w", "a", "s", "d"].includes(key)) {
@@ -1070,6 +1275,22 @@ async function refreshWaypoints() {
   }
 }
 
+function renderWaypoints() {
+  const snapshot = dashboardState.snapshot;
+  const select = elements["waypoint-select"];
+  if (!snapshot || !select) {
+    return;
+  }
+  const waypoints = snapshot.waypoints || {};
+  const current = select.value;
+  select.innerHTML = Object.entries(waypoints).map(([name, coords]) =>
+    `<option value="${escapeAttribute(name)}">${escapeHtml(name)} (${formatNumber(coords[0])}, ${formatNumber(coords[1])})</option>`,
+  ).join("");
+  if (current && waypoints[current]) {
+    select.value = current;
+  }
+}
+
 async function refreshConfig() {
   try {
     const response = await fetch("/config");
@@ -1116,25 +1337,58 @@ function collectConfigValues() {
   return payload;
 }
 
+async function startArmVoiceTest() {
+  elements["arm-voice-detail"].textContent = "Starting…";
+  try {
+    await postJson("/arm/voice", { action: "start", mode: "local_fake" });
+  } catch (error) {
+    setPillState(elements["arm-voice-pill"], "status-error", "Error");
+    elements["arm-voice-detail"].textContent = String(error.message || error);
+  }
+}
+
+async function stopArmVoiceTest() {
+  elements["arm-voice-detail"].textContent = "Stopping…";
+  try {
+    await postJson("/arm/voice", { action: "stop" });
+  } catch (error) {
+    elements["arm-voice-detail"].textContent = String(error.message || error);
+  }
+}
+
+async function refreshPickupDetection() {
+  elements["pickup-detail"].textContent = "Refreshing…";
+  try {
+    await postJson("/pickup", { action: "refresh" });
+  } catch (error) {
+    elements["pickup-detail"].textContent = String(error.message || error);
+  }
+}
+
+async function startPickup() {
+  elements["pickup-detail"].textContent = "Starting…";
+  try {
+    await postJson("/pickup", { action: "start" });
+  } catch (error) {
+    elements["pickup-detail"].textContent = String(error.message || error);
+  }
+}
+
+async function stopPickup() {
+  try {
+    await postJson("/pickup", { action: "stop" });
+  } catch (error) {
+    elements["pickup-detail"].textContent = String(error.message || error);
+  }
+}
+
 function initCameraStream() {
-  elements["camera-stream"].src = `/camera?stream=${Date.now()}`;
-}
-
-function reloadFoxgloveFrame() {
-  const frame = elements["foxglove-frame"];
-  if (!dashboardState.foxgloveEmbedUrl) {
-    return;
-  }
-  const reloaded = `${dashboardState.foxgloveEmbedUrl}${dashboardState.foxgloveEmbedUrl.includes("?") ? "&" : "?"}reload=${Date.now()}`;
-  frame.src = reloaded;
-  frame.dataset.loadedSrc = dashboardState.foxgloveEmbedUrl;
-}
-
-function openFoxgloveExternal() {
-  if (!dashboardState.foxgloveEmbedUrl) {
-    return;
-  }
-  window.open(dashboardState.foxgloveEmbedUrl, "_blank", "noopener,noreferrer");
+  const img = elements["camera-stream"];
+  img.src = `/camera?stream=${Date.now()}`;
+  img.addEventListener("load", () => {
+    resizeOverlayCanvas(elements["camera-overlay"]);
+    renderCameraOverlay();
+  }, { once: false });
 }
 
 function resizeCanvases() {
@@ -1170,17 +1424,8 @@ function resizeOverlayCanvas(canvas) {
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
 }
 
-function activateTab(tabName) {
-  elements.tabButtons.forEach((button) => {
-    button.classList.toggle("active", button.dataset.tab === tabName);
-  });
-  elements.tabContents.forEach((content) => {
-    content.classList.toggle("active", content.id === `tab-${tabName}`);
-  });
-}
-
 function updateMapModeLabel() {
-  elements["map-mode-label"].textContent = `Click mode: ${dashboardState.mapMode}`;
+  elements["map-mode-label"].textContent = `Click: ${dashboardState.mapMode}`;
 }
 
 async function postJson(url, payload) {
@@ -1196,20 +1441,6 @@ async function postJson(url, payload) {
   return response.json();
 }
 
-function buildFoxgloveWsUrl(foxglove) {
-  const hostname = window.location.hostname || "127.0.0.1";
-  const port = foxglove.port || 8765;
-  return `ws://${hostname}:${port}`;
-}
-
-function buildFoxgloveEmbedUrl(foxglove, bridgeUrl) {
-  const base = foxglove.viewer_url || "https://app.foxglove.dev/";
-  const url = new URL(base);
-  url.searchParams.set("ds", "foxglove-websocket");
-  url.searchParams.set("ds.url", bridgeUrl);
-  return url.toString();
-}
-
 function worldToCanvas(x, y, map, canvas) {
   const rows = map.shape ? map.shape[0] : 0;
   const cols = map.shape ? map.shape[1] : 0;
@@ -1222,10 +1453,7 @@ function worldToCanvas(x, y, map, canvas) {
   }
   const col = x / resolution + origin;
   const row = rows - (y / resolution + origin);
-  return {
-    x: (col / cols) * width,
-    y: (row / rows) * height,
-  };
+  return { x: (col / cols) * width, y: (row / rows) * height };
 }
 
 function canvasToWorld(px, py, map, canvas) {
@@ -1265,13 +1493,13 @@ function setPillState(element, className, label) {
 
 function statusClassFor(status) {
   const normalized = String(status || "disconnected").toLowerCase();
-  if (normalized === "connected" || normalized === "running" || normalized === "starting" || normalized === "ready" || normalized === "success") {
+  if (["connected", "running", "starting", "ready", "success"].includes(normalized)) {
     return "status-connected";
   }
   if (normalized === "error") {
     return "status-error";
   }
-  if (normalized === "warning" || normalized === "warn" || normalized === "searching") {
+  if (["warning", "warn", "searching"].includes(normalized)) {
     return "status-warn";
   }
   return "status-disconnected";
@@ -1279,40 +1507,21 @@ function statusClassFor(status) {
 
 function humanizeStatus(status) {
   const normalized = String(status || "disconnected").toLowerCase();
-  if (normalized === "connected") {
-    return "Connected";
-  }
-  if (normalized === "running") {
-    return "Running";
-  }
-  if (normalized === "starting") {
-    return "Starting";
-  }
-  if (normalized === "stopping") {
-    return "Stopping";
-  }
-  if (normalized === "idle") {
-    return "Idle";
-  }
-  if (normalized === "error") {
-    return "Error";
-  }
-  if (normalized === "ready") {
-    return "Ready";
-  }
-  if (normalized === "success") {
-    return "Success";
-  }
-  if (normalized === "searching") {
-    return "Searching";
-  }
-  if (normalized === "stopped") {
-    return "Stopped";
-  }
-  if (normalized === "warning" || normalized === "warn") {
-    return "Warning";
-  }
-  return "Disconnected";
+  const map = {
+    connected: "OK",
+    running: "Run",
+    starting: "Start",
+    stopping: "Stop",
+    idle: "Idle",
+    error: "Err",
+    ready: "Ready",
+    success: "OK",
+    searching: "Scan",
+    stopped: "Off",
+    warning: "Warn",
+    warn: "Warn",
+  };
+  return map[normalized] || "—";
 }
 
 function formatNumber(value, digits = 2) {
@@ -1343,5 +1552,3 @@ function escapeHtml(value) {
 function escapeAttribute(value) {
   return escapeHtml(value);
 }
-
-const MAX_LOGS = 250;

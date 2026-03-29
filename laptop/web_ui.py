@@ -2,12 +2,14 @@
 Lightweight http dashboard for the autonomous wheelchair demo.
 
 Runs in two modes:
-  - standalone demo mode (`python laptop/web_ui.py`)
+  - standalone demo mode (`python laptop/web_ui.py`, synthetic telemetry by default)
+  - optional HyperIMU: `python laptop/web_ui.py --imu` (UDP listener + dashboard)
   - embedded mode where the rest of the stack pushes state via setters
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
 import copy
@@ -45,6 +47,11 @@ try:
     from pickup_controller import PickupControllerError, create_pickup_controller
 except ImportError:  # pragma: no cover - useful if imported as a namespace package
     from laptop.pickup_controller import PickupControllerError, create_pickup_controller
+
+try:
+    from phone_imu import create_phone_imu
+except ImportError:  # pragma: no cover - useful if imported as a namespace package
+    from laptop.phone_imu import create_phone_imu
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +132,7 @@ class WebUI:
         self._arm_voice_stderr_task: Optional[asyncio.Task] = None
         self._arm_voice_watch_task: Optional[asyncio.Task] = None
         self._arm_voice_stop_requested = False
+        self._imu_poll_task: Optional[asyncio.Task] = None
         self._started = False
 
         self._camera_jpeg: bytes = PLACEHOLDER_JPEG
@@ -179,6 +187,7 @@ class WebUI:
             self._demo_task,
             self._foxglove_task,
             self._pickup_poll_task,
+            self._imu_poll_task,
             self._arm_voice_stdout_task,
             self._arm_voice_stderr_task,
             self._arm_voice_watch_task,
@@ -212,6 +221,19 @@ class WebUI:
         self._site = None
         self._foxglove_task = None
         self._pickup_poll_task = None
+        self._imu_poll_task = None
+
+    async def start_imu_poller(self, imu: Any, interval_s: float = 0.05) -> None:
+        """Poll HyperIMU UDP samples and push into dashboard state."""
+
+        async def _loop() -> None:
+            while self._started:
+                data = imu.get_latest()
+                if data is not None:
+                    self.set_imu_state(data)
+                await asyncio.sleep(interval_s)
+
+        self._imu_poll_task = asyncio.create_task(_loop(), name="web-ui-imu-poll")
 
     def set_pose(self, pose: Any = None, **kwargs: Any) -> None:
         payload = self._normalize_pose(pose, **kwargs)
@@ -461,9 +483,16 @@ class WebUI:
         )
         self._set_state_key("imu", payload)
         if payload["receiving"]:
-            self.set_subsystem_status("IMU", "connected", f"gyro z {payload['gyro_z']:.3f} rad/s")
+            gx = float(payload["gyro_x"])
+            gy = float(payload["gyro_y"])
+            gz = float(payload["gyro_z"])
+            self.set_subsystem_status(
+                "IMU",
+                "connected",
+                f"gyro rad/s {gx:.2f},{gy:.2f},{gz:.2f}",
+            )
         else:
-            self.set_subsystem_status("IMU", "disconnected", "No recent packets")
+            self.set_subsystem_status("IMU", "disconnected", "No UDP (enable HyperIMU + gyro)")
 
     def set_subsystem_status(
         self,
@@ -1651,14 +1680,22 @@ class WebUI:
         return datetime.now().isoformat(timespec="seconds")
 
 
-async def _main() -> None:
+async def _main_async(args: argparse.Namespace) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
-    ui = create_web_ui(fake=True)
-    url = await ui.start(host="127.0.0.1", port=8766)
+    ui = create_web_ui(fake=args.fake)
+    imu = None
+    if args.imu:
+        imu = create_phone_imu(fake=False)
+        await imu.start()
+
+    url = await ui.start(host=args.host, port=args.port)
     print(f"Dashboard running at {url}")
+    if args.imu and imu is not None:
+        await ui.start_imu_poller(imu, interval_s=args.imu_interval)
+
     try:
         while True:
             await asyncio.sleep(3600)
@@ -1666,7 +1703,40 @@ async def _main() -> None:
         pass
     finally:
         await ui.stop()
+        if imu is not None:
+            with contextlib.suppress(Exception):
+                await imu.stop()
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Wheelchair web dashboard")
+    parser.set_defaults(fake=True)
+    parser.add_argument("--host", default="127.0.0.1", help="Bind address")
+    parser.add_argument("--port", type=int, default=8766, help="HTTP port")
+    parser.add_argument(
+        "--no-fake",
+        dest="fake",
+        action="store_false",
+        help="Disable synthetic demo telemetry (default: demo on)",
+    )
+    parser.add_argument(
+        "--imu",
+        action="store_true",
+        help="Listen for HyperIMU UDP (see config phone_imu.udp_port, default 5555)",
+    )
+    parser.add_argument(
+        "--imu-interval",
+        type=float,
+        default=0.05,
+        metavar="SEC",
+        help="Seconds between IMU polls (default 0.05)",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    asyncio.run(_main_async(_parse_args()))
 
 
 if __name__ == "__main__":
-    asyncio.run(_main())
+    main()
