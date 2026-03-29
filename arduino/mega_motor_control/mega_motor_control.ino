@@ -13,6 +13,8 @@
  *            "s"            — backward
  *            "a"            — strafe left
  *            "d"            — strafe right
+ *            "e"            — turn CW
+ *            "f"            — turn CCW
  *            "1"-"4"        — spin wheel CW  (FL, FR, RL, RR)
  *            "5"-"8"        — spin wheel CCW (FL, FR, RL, RR)
  *   Note: single-char movement commands run until watchdog cuts them (~500ms)
@@ -21,14 +23,14 @@
  *
  * Motor driver wiring (IBT-2 RPWM/LPWM):
  *   FL: RPWM=D13, LPWM=D12
- *   FR: RPWM=D4,  LPWM=D5
+ *   FR: RPWM=D2,  LPWM=D3
  *   RL: RPWM=D10, LPWM=D11
- *   RR: RPWM=D2,  LPWM=D3
+ *   RR: RPWM=D4,  LPWM=D5
  * Encoder wiring (quadrature, interrupt-driven on CHN A rising edge):
  *   FL: CHN A=D18(INT5), CHN B=D22
- *   FR: CHN A=D19(INT4), CHN B=D23
+ *   FR: CHN A=D21(INT2), CHN B=D53
  *   RL: CHN A=D20(INT3), CHN B=D52
- *   RR: CHN A=D21(INT2), CHN B=D53
+ *   RR: CHN A=D19(INT4), CHN B=D23
  * E-stop: software only — send 'q' over serial
  *
  * Dependencies: ArduinoJson (v7.x)
@@ -44,45 +46,45 @@
 #define PIN_FL_RPWM  13
 #define PIN_FL_LPWM  12
 
-// Motor FR (Front-Right) — driver 3
-#define PIN_FR_RPWM   4
-#define PIN_FR_LPWM   5
+// Motor FR (Front-Right) — driver 4
+#define PIN_FR_RPWM   2
+#define PIN_FR_LPWM   3
 
 // Motor RL (Rear-Left)   — driver 2
 #define PIN_RL_RPWM  10
 #define PIN_RL_LPWM  11
 
-// Motor RR (Rear-Right)  — driver 4
-#define PIN_RR_RPWM   2
-#define PIN_RR_LPWM   3
+// Motor RR (Rear-Right)  — driver 3
+#define PIN_RR_RPWM   4
+#define PIN_RR_LPWM   5
 
 // Encoder CHN A pins (interrupt-driven — INT5/4/3/2)
 #define PIN_ENC_FL_A  18   // INT5
-#define PIN_ENC_FR_A  19   // INT4
+#define PIN_ENC_FR_A  21   // INT2
 #define PIN_ENC_RL_A  20   // INT3
-#define PIN_ENC_RR_A  21   // INT2
+#define PIN_ENC_RR_A  19   // INT4
 // Encoder CHN B pins (direction sense, read inside ISR)
 #define PIN_ENC_FL_B  22
-#define PIN_ENC_FR_B  23
+#define PIN_ENC_FR_B  53
 #define PIN_ENC_RL_B  52
-#define PIN_ENC_RR_B  53
+#define PIN_ENC_RR_B  23
 
 // ============================================================
 // 2. CONFIGURATION
 // ============================================================
 
-// Motor direction signs: flip to +1 or -1 after hardware test.
+// Motor direction signs: FL/RR pair, FR/RL pair inverted for correct strafe.
 //                          FL   FR   RL   RR
-const int MOTOR_SIGN[4] = { +1,  +1,  +1,  +1 };
+const int MOTOR_SIGN[4] = { -1,  +1,  -1,  +1 };
 
 // Encoder direction signs: flip if ticks go negative during forward motion.
 //                            FL   FR   RL   RR
 const int ENC_SIGN[4]   = { +1,  +1,  +1,  +1 };
 
-#define PWM_MAX              15   // TESTING: just enough to verify motors respond. Raise to 60+ once verified. Max is 255.
+#define PWM_MAX             100   // ~40% duty cycle. Raise toward 255 if motors still stall.
 #define SERIAL_BAUD         115200
-#define WATCHDOG_TIMEOUT_MS 500
-#define LOOP_PERIOD_MS       10   // ~100 Hz
+#define WATCHDOG_TIMEOUT_MS 1000
+#define LOOP_PERIOD_MS       50   // ~20 Hz
 #define SERIAL_BUF_SIZE     128
 
 // ============================================================
@@ -106,8 +108,13 @@ uint8_t serialBufIdx = 0;
 // Encoder counters (volatile, written from ISRs)
 volatile int32_t encCount[4] = { 0, 0, 0, 0 };
 
-// Last sent counts — we report delta ticks each loop
-int32_t encLast[4] = { 0, 0, 0, 0 };
+// Encoder snapshot taken at command start — for one-shot end-of-run report
+int32_t encRunStart[4] = { 0, 0, 0, 0 };
+
+// motorCommand snapshot at run start — to know which motors were active
+int activeMotors[4] = { 0, 0, 0, 0 };
+
+bool motorsRunning = false;
 
 // ============================================================
 // 4. ENCODER ISRs
@@ -214,22 +221,26 @@ bool processSerialLine(const char* line) {
       return true;
 
     // ---- directional (wasd) ----
-    case 'w': computeMecanumIK( 1.0f,  0.0f, 0.0f); lastCommandTime = millis(); return true;
-    case 's': computeMecanumIK(-1.0f,  0.0f, 0.0f); lastCommandTime = millis(); return true;
-    case 'a': computeMecanumIK( 0.0f, -1.0f, 0.0f); lastCommandTime = millis(); return true;
-    case 'd': computeMecanumIK( 0.0f,  1.0f, 0.0f); lastCommandTime = millis(); return true;
+    case 'w': computeMecanumIK( 1.0f,  0.0f, 0.0f); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case 's': computeMecanumIK(-1.0f,  0.0f, 0.0f); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case 'a': computeMecanumIK( 0.0f, -1.0f, 0.0f); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case 'd': computeMecanumIK( 0.0f,  1.0f, 0.0f); lastCommandTime = millis(); startRunSnapshot(); return true;
+
+    // ---- turn (e/f) ----
+    case 'e': computeMecanumIK( 0.0f,  0.0f, -1.0f); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case 'f': computeMecanumIK( 0.0f,  0.0f,  1.0f); lastCommandTime = millis(); startRunSnapshot(); return true;
 
     // ---- individual wheel CW (1-4 = FL, FR, RL, RR) ----
-    case '1': spinOneMotor(FL,  PWM_MAX); lastCommandTime = millis(); return true;
-    case '2': spinOneMotor(FR,  PWM_MAX); lastCommandTime = millis(); return true;
-    case '3': spinOneMotor(RL,  PWM_MAX); lastCommandTime = millis(); return true;
-    case '4': spinOneMotor(RR,  PWM_MAX); lastCommandTime = millis(); return true;
+    case '1': spinOneMotor(FL,  PWM_MAX); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case '2': spinOneMotor(FR,  PWM_MAX); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case '3': spinOneMotor(RL,  PWM_MAX); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case '4': spinOneMotor(RR,  PWM_MAX); lastCommandTime = millis(); startRunSnapshot(); return true;
 
     // ---- individual wheel CCW (5-8 = FL, FR, RL, RR) ----
-    case '5': spinOneMotor(FL, -PWM_MAX); lastCommandTime = millis(); return true;
-    case '6': spinOneMotor(FR, -PWM_MAX); lastCommandTime = millis(); return true;
-    case '7': spinOneMotor(RL, -PWM_MAX); lastCommandTime = millis(); return true;
-    case '8': spinOneMotor(RR, -PWM_MAX); lastCommandTime = millis(); return true;
+    case '5': spinOneMotor(FL, -PWM_MAX); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case '6': spinOneMotor(FR, -PWM_MAX); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case '7': spinOneMotor(RL, -PWM_MAX); lastCommandTime = millis(); startRunSnapshot(); return true;
+    case '8': spinOneMotor(RR, -PWM_MAX); lastCommandTime = millis(); startRunSnapshot(); return true;
   }
 
 json:
@@ -260,28 +271,35 @@ void readSerial() {
 }
 
 // ============================================================
-// 8. SERIAL RESPONSE
+// 8. ENCODER REPORTING
 // ============================================================
 
-void sendStatus() {
+// Call when a new command starts — snapshot current counts and record active motors
+void startRunSnapshot() {
+  noInterrupts();
+  for (uint8_t i = 0; i < 4; i++) encRunStart[i] = encCount[i];
+  interrupts();
+  for (uint8_t i = 0; i < 4; i++) activeMotors[i] = motorCommand[i];
+  motorsRunning = true;
+
+  Serial.print("start enc: FL="); Serial.print(encRunStart[FL]);
+  Serial.print(" FR=");           Serial.print(encRunStart[FR]);
+  Serial.print(" RL=");           Serial.print(encRunStart[RL]);
+  Serial.print(" RR=");           Serial.println(encRunStart[RR]);
+}
+
+// Call once when motors stop — print delta ticks for active motors only
+void printRunReport() {
   int32_t snap[4];
   noInterrupts();
   for (uint8_t i = 0; i < 4; i++) snap[i] = encCount[i];
   interrupts();
 
-  int32_t delta[4];
-  for (uint8_t i = 0; i < 4; i++) {
-    delta[i] = snap[i] - encLast[i];
-    encLast[i] = snap[i];
-  }
-
-  JsonDocument doc;
-  doc["estop"] = estopActive ? 1 : 0;
-  JsonArray enc = doc["enc"].to<JsonArray>();
-  for (uint8_t i = 0; i < 4; i++) enc.add(delta[i]);
-
-  serializeJson(doc, Serial);
-  Serial.println();
+  Serial.print("end enc: FL="); Serial.print(snap[FL] - encRunStart[FL]);
+  Serial.print(" FR=");         Serial.print(snap[FR] - encRunStart[FR]);
+  Serial.print(" RL=");         Serial.print(snap[RL] - encRunStart[RL]);
+  Serial.print(" RR=");         Serial.println(snap[RR] - encRunStart[RR]);
+  motorsRunning = false;
 }
 
 // ============================================================
@@ -325,6 +343,7 @@ void loop() {
 
   // Watchdog
   if ((millis() - lastCommandTime) > WATCHDOG_TIMEOUT_MS) {
+    if (motorsRunning) printRunReport();
     stopAllMotors();
   }
 
@@ -334,8 +353,6 @@ void loop() {
   } else {
     for (uint8_t i = 0; i < 4; i++) setMotor(i, motorCommand[i]);
   }
-
-  sendStatus();
 
   // Maintain loop rate
   unsigned long elapsed = millis() - loopStart;
