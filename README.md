@@ -1,1 +1,1 @@
-moduluar attatchment to create autonomous chairs 🤖♿️
+modular attachment to create autonomous chairs 🤖♿️
