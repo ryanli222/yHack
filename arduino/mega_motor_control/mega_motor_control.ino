@@ -7,6 +7,15 @@
  *
  * Serial protocol (115200 baud, newline-delimited JSON):
  *   Receive: {"vx": float, "vy": float, "w": float}
+ *            "q"            — e-stop (stop all motors)
+ *            "r"            — resume (clear e-stop)
+ *            "w"            — forward
+ *            "s"            — backward
+ *            "a"            — strafe left
+ *            "d"            — strafe right
+ *            "1"-"4"        — spin wheel CW  (FL, FR, RL, RR)
+ *            "5"-"8"        — spin wheel CCW (FL, FR, RL, RR)
+ *   Note: single-char movement commands run until watchdog cuts them (~500ms)
  *   Send:    {"estop": 0|1, "enc": [dFL, dFR, dRL, dRR]}
  *            enc = delta ticks since last report (signed int32)
  *
@@ -15,12 +24,12 @@
  *   FR: RPWM=D4,  LPWM=D5
  *   RL: RPWM=D10, LPWM=D11
  *   RR: RPWM=D2,  LPWM=D3
- * Encoder wiring (quadrature, 1x decode on channel A):
- *   FL: A=D2(INT0), B=D3 — CONFLICT with RR motor pins; move if using encoders
- *   FR: A=D18(INT5), B=D19
- *   RL: A=D20(INT3), B=D21
- *   RR: A=D22(polled), B=D23
- * E-stop: D32 (active LOW, polled)
+ * Encoder wiring (quadrature, interrupt-driven on CHN A rising edge):
+ *   FL: CHN A=D18(INT5), CHN B=D22
+ *   FR: CHN A=D19(INT4), CHN B=D23
+ *   RL: CHN A=D20(INT3), CHN B=D52
+ *   RR: CHN A=D21(INT2), CHN B=D53
+ * E-stop: software only — send 'q' over serial
  *
  * Dependencies: ArduinoJson (v7.x)
  */
@@ -44,23 +53,19 @@
 #define PIN_RL_LPWM  11
 
 // Motor RR (Rear-Right)  — driver 4
-// NOTE: D2/D3 were previously FL encoder A/B. If encoders are wired,
-//       move FL encoder to free pins (e.g. D34/D35) and update below.
 #define PIN_RR_RPWM   2
 #define PIN_RR_LPWM   3
 
-// E-stop button (active LOW, polled — D32 has no external INT on Mega)
-#define PIN_ESTOP     32
-
-// Encoder channel A pins (interrupt-driven for FL/FR/RL, polled for RR)
-#define PIN_ENC_FL_A   2   // INT0
-#define PIN_ENC_FL_B   3
-#define PIN_ENC_FR_A  18   // INT5
-#define PIN_ENC_FR_B  19
+// Encoder CHN A pins (interrupt-driven — INT5/4/3/2)
+#define PIN_ENC_FL_A  18   // INT5
+#define PIN_ENC_FR_A  19   // INT4
 #define PIN_ENC_RL_A  20   // INT3
-#define PIN_ENC_RL_B  21
-#define PIN_ENC_RR_A  22   // polled
-#define PIN_ENC_RR_B  23
+#define PIN_ENC_RR_A  21   // INT2
+// Encoder CHN B pins (direction sense, read inside ISR)
+#define PIN_ENC_FL_B  22
+#define PIN_ENC_FR_B  23
+#define PIN_ENC_RL_B  52
+#define PIN_ENC_RR_B  53
 
 // ============================================================
 // 2. CONFIGURATION
@@ -98,14 +103,11 @@ unsigned long lastCommandTime = 0;
 char serialBuf[SERIAL_BUF_SIZE];
 uint8_t serialBufIdx = 0;
 
-// ---- Encoder counters (volatile, written from ISRs) ----
+// Encoder counters (volatile, written from ISRs)
 volatile int32_t encCount[4] = { 0, 0, 0, 0 };
 
 // Last sent counts — we report delta ticks each loop
 int32_t encLast[4] = { 0, 0, 0, 0 };
-
-// Last known state of RR channel A (for polling)
-uint8_t rrLastA = 0;
 
 // ============================================================
 // 4. ENCODER ISRs
@@ -124,6 +126,11 @@ void encISR_FR() {
 void encISR_RL() {
   if (digitalRead(PIN_ENC_RL_B) == HIGH) encCount[RL] += ENC_SIGN[RL];
   else                                    encCount[RL] -= ENC_SIGN[RL];
+}
+
+void encISR_RR() {
+  if (digitalRead(PIN_ENC_RR_B) == HIGH) encCount[RR] += ENC_SIGN[RR];
+  else                                    encCount[RR] -= ENC_SIGN[RR];
 }
 
 // ============================================================
@@ -186,7 +193,46 @@ void computeMecanumIK(float vx, float vy, float omega) {
 // 7. SERIAL PARSING
 // ============================================================
 
+// Set one motor, zero the rest — used for per-wheel spin tests
+void spinOneMotor(uint8_t idx, int speed) {
+  for (uint8_t i = 0; i < 4; i++) motorCommand[i] = 0;
+  motorCommand[idx] = speed;
+}
+
 bool processSerialLine(const char* line) {
+  if (line[1] != '\0') goto json;  // more than one char → must be JSON
+
+  switch (line[0]) {
+    // ---- control ----
+    case 'q':
+      estopActive = true;
+      stopAllMotors();
+      return true;
+    case 'r':
+      estopActive = false;
+      lastCommandTime = millis();
+      return true;
+
+    // ---- directional (wasd) ----
+    case 'w': computeMecanumIK( 1.0f,  0.0f, 0.0f); lastCommandTime = millis(); return true;
+    case 's': computeMecanumIK(-1.0f,  0.0f, 0.0f); lastCommandTime = millis(); return true;
+    case 'a': computeMecanumIK( 0.0f, -1.0f, 0.0f); lastCommandTime = millis(); return true;
+    case 'd': computeMecanumIK( 0.0f,  1.0f, 0.0f); lastCommandTime = millis(); return true;
+
+    // ---- individual wheel CW (1-4 = FL, FR, RL, RR) ----
+    case '1': spinOneMotor(FL,  PWM_MAX); lastCommandTime = millis(); return true;
+    case '2': spinOneMotor(FR,  PWM_MAX); lastCommandTime = millis(); return true;
+    case '3': spinOneMotor(RL,  PWM_MAX); lastCommandTime = millis(); return true;
+    case '4': spinOneMotor(RR,  PWM_MAX); lastCommandTime = millis(); return true;
+
+    // ---- individual wheel CCW (5-8 = FL, FR, RL, RR) ----
+    case '5': spinOneMotor(FL, -PWM_MAX); lastCommandTime = millis(); return true;
+    case '6': spinOneMotor(FR, -PWM_MAX); lastCommandTime = millis(); return true;
+    case '7': spinOneMotor(RL, -PWM_MAX); lastCommandTime = millis(); return true;
+    case '8': spinOneMotor(RR, -PWM_MAX); lastCommandTime = millis(); return true;
+  }
+
+json:
   JsonDocument doc;
   if (deserializeJson(doc, line)) return false;
   if (!doc.containsKey("vx") || !doc.containsKey("vy") || !doc.containsKey("w")) return false;
@@ -218,7 +264,6 @@ void readSerial() {
 // ============================================================
 
 void sendStatus() {
-  // Atomically snapshot delta ticks (disable interrupts briefly)
   int32_t snap[4];
   noInterrupts();
   for (uint8_t i = 0; i < 4; i++) snap[i] = encCount[i];
@@ -254,26 +299,16 @@ void setup() {
     analogWrite(pinLPWM[i], 0);
   }
 
-  // E-stop (active LOW, internal pull-up, polled)
-  pinMode(PIN_ESTOP, INPUT_PULLUP);
-  estopActive = (digitalRead(PIN_ESTOP) == LOW);
-
-  // Encoder channel A — interrupt pins
-  pinMode(PIN_ENC_FL_A, INPUT_PULLUP);
-  pinMode(PIN_ENC_FL_B, INPUT_PULLUP);
-  pinMode(PIN_ENC_FR_A, INPUT_PULLUP);
-  pinMode(PIN_ENC_FR_B, INPUT_PULLUP);
-  pinMode(PIN_ENC_RL_A, INPUT_PULLUP);
-  pinMode(PIN_ENC_RL_B, INPUT_PULLUP);
+  // Encoder pins
+  pinMode(PIN_ENC_FL_A, INPUT_PULLUP); pinMode(PIN_ENC_FL_B, INPUT_PULLUP);
+  pinMode(PIN_ENC_FR_A, INPUT_PULLUP); pinMode(PIN_ENC_FR_B, INPUT_PULLUP);
+  pinMode(PIN_ENC_RL_A, INPUT_PULLUP); pinMode(PIN_ENC_RL_B, INPUT_PULLUP);
+  pinMode(PIN_ENC_RR_A, INPUT_PULLUP); pinMode(PIN_ENC_RR_B, INPUT_PULLUP);
 
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_FL_A), encISR_FL, RISING);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_FR_A), encISR_FR, RISING);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_RL_A), encISR_RL, RISING);
-
-  // RR encoder — polled
-  pinMode(PIN_ENC_RR_A, INPUT_PULLUP);
-  pinMode(PIN_ENC_RR_B, INPUT_PULLUP);
-  rrLastA = digitalRead(PIN_ENC_RR_A);
+  attachInterrupt(digitalPinToInterrupt(PIN_ENC_RR_A), encISR_RR, RISING);
 
   lastCommandTime = millis();
   Serial.println("{\"status\":\"ready\"}");
@@ -288,22 +323,10 @@ void loop() {
 
   readSerial();
 
-  // Poll e-stop
-  estopActive = (digitalRead(PIN_ESTOP) == LOW);
-
   // Watchdog
   if ((millis() - lastCommandTime) > WATCHDOG_TIMEOUT_MS) {
     stopAllMotors();
   }
-
-  // Poll RR encoder (channel A rising edge)
-  uint8_t rrNowA = digitalRead(PIN_ENC_RR_A);
-  if (rrNowA == HIGH && rrLastA == LOW) {
-    // Rising edge detected
-    if (digitalRead(PIN_ENC_RR_B) == HIGH) encCount[RR] += ENC_SIGN[RR];
-    else                                    encCount[RR] -= ENC_SIGN[RR];
-  }
-  rrLastA = rrNowA;
 
   // Drive or stop motors
   if (estopActive) {
