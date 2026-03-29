@@ -1,50 +1,26 @@
-/**
- * Floating windows: drag title bars, minimize / maximize, layout persisted in localStorage.
- */
-
-const WINDOW_IDS = ["map", "camera", "telemetry", "systems", "world", "ops", "config", "logs"];
-const SECONDARY_IDS = ["systems", "world", "ops", "config", "logs"];
-const STORAGE_WINDOWS = "wheelchairFloatWindows";
-
-let windowLayout = {};
-let zCounter = 30;
-let dragState = null;
-/** Saved normal rect when maximizing (per window id). */
-const maxRestore = {};
+const MAX_LOGS = 120;
+const MAP_EMPTY_SHADE = 228;
+const MAP_OBSTACLE_SHADE = 72;
 
 const dashboardState = {
   snapshot: null,
   ws: null,
   reconnectTimer: null,
+  cameraRetryTimer: null,
   mapMode: "goal",
-  configRenderedHash: "",
-  keyboardVector: { vx: 0, vy: 0, omega: 0 },
-  keyboardInterval: null,
-  joystick: {
-    active: false,
-    pointerId: null,
-    vx: 0,
-    vy: 0,
-    interval: null,
-  },
-  visibleLogs: [],
+  selectedWaypoint: "",
 };
 
 const elements = {};
-const MAX_LOGS = 250;
 
 document.addEventListener("DOMContentLoaded", () => {
   cacheElements();
-  initFloatingWindows();
   bindEvents();
+  initCameraStream();
   connectWebSocket();
   refreshWaypoints();
-  refreshConfig();
-  initCameraStream();
-  requestAnimationFrame(() => {
-    resizeCanvases();
-    renderAll();
-  });
+  resizeCanvases();
+  renderAll();
   window.addEventListener("resize", () => {
     resizeCanvases();
     renderAll();
@@ -56,21 +32,41 @@ function cacheElements() {
     "robot-name",
     "connection-pill",
     "snapshot-rate",
+    "nav-state-summary",
+    "nav-mode-summary",
+    "goal-summary",
+    "object-target-label",
+    "object-target-detail",
+    "listen-target-button",
+    "set-target-button",
+    "clear-target-button",
+    "planner-banner",
+    "waypoint-select",
+    "goto-button",
+    "reload-waypoints-button",
+    "stop-button",
+    "map-mode-chip",
+    "map-mode-goal-button",
+    "map-mode-waypoint-button",
     "map-canvas",
-    "map-mode-label",
     "map-cursor-coords",
     "camera-stream",
-    "camera-overlay",
-    "pose-xyz",
-    "pose-vel-line",
-    "nav-line",
-    "nav-estop",
-    "imu-gyro-z",
-    "joystick-pad",
-    "joystick-knob",
-    "joystick-readout",
-    "waypoint-select",
-    "goal-summary",
+    "lidar-canvas",
+    "lidar-pill",
+    "lidar-points",
+    "lidar-obstacles",
+    "lidar-map-shape",
+    "lidar-detail",
+    "pid-command",
+    "pid-pose",
+    "pid-estop",
+    "pid-note",
+    "imu-pill",
+    "imu-status",
+    "imu-gyro",
+    "imu-accel",
+    "imu-age",
+    "imu-note",
     "arm-voice-pill",
     "arm-voice-detail",
     "arm-voice-start-button",
@@ -80,486 +76,72 @@ function cacheElements() {
     "pickup-refresh-button",
     "pickup-start-button",
     "pickup-stop-button",
-    "voice-transcript",
-    "voice-response",
-    "subsystems-tree",
-    "obstacles-list",
-    "landmarks-list",
-    "config-form",
-    "config-note",
+    "subsystems-list",
     "log-viewer",
   ].forEach((id) => {
     elements[id] = document.getElementById(id);
   });
-  elements.mapModeButtons = Array.from(document.querySelectorAll("[data-map-mode]"));
-  elements.teleopButtons = Array.from(document.querySelectorAll(".pad-btn[data-teleop]"));
-}
-
-function defaultWindowLayout() {
-  return {
-    map: { x: 0.02, y: 0.05, w: 0.71, h: 0.44, min: false, max: false, z: 10 },
-    camera: { x: 0.02, y: 0.51, w: 0.71, h: 0.42, min: false, max: false, z: 11 },
-    telemetry: { x: 0.745, y: 0.05, w: 0.235, h: 0.88, min: false, max: false, z: 12 },
-    systems: {
-      x: 0.05,
-      y: 0.48,
-      w: 0.32,
-      h: 0.4,
-      min: false,
-      max: false,
-      z: 13,
-      norm: { x: 0.05, y: 0.48, w: 0.32, h: 0.4 },
-      opened: false,
-    },
-    world: {
-      x: 0.37,
-      y: 0.48,
-      w: 0.32,
-      h: 0.4,
-      min: false,
-      max: false,
-      z: 14,
-      norm: { x: 0.37, y: 0.48, w: 0.32, h: 0.4 },
-      opened: false,
-    },
-    ops: {
-      x: 0.52,
-      y: 0.48,
-      w: 0.32,
-      h: 0.4,
-      min: false,
-      max: false,
-      z: 15,
-      norm: { x: 0.52, y: 0.48, w: 0.32, h: 0.4 },
-      opened: false,
-    },
-    config: {
-      x: 0.18,
-      y: 0.52,
-      w: 0.34,
-      h: 0.36,
-      min: false,
-      max: false,
-      z: 16,
-      norm: { x: 0.18, y: 0.52, w: 0.34, h: 0.36 },
-      opened: false,
-    },
-    logs: {
-      x: 0.48,
-      y: 0.52,
-      w: 0.34,
-      h: 0.36,
-      min: false,
-      max: false,
-      z: 17,
-      norm: { x: 0.48, y: 0.52, w: 0.34, h: 0.36 },
-      opened: false,
-    },
-  };
-}
-
-function loadWindowLayout() {
-  const base = defaultWindowLayout();
-  try {
-    const raw = localStorage.getItem(STORAGE_WINDOWS);
-    if (!raw) {
-      return base;
-    }
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") {
-      return base;
-    }
-    const merged = { ...base };
-    for (const id of WINDOW_IDS) {
-      if (parsed[id] && typeof parsed[id] === "object") {
-        merged[id] = { ...base[id], ...parsed[id] };
-        for (const k of ["x", "y", "w", "h", "z"]) {
-          if (typeof merged[id][k] !== "number" || Number.isNaN(merged[id][k])) {
-            merged[id][k] = base[id][k];
-          }
-        }
-        merged[id].min = Boolean(merged[id].min);
-        merged[id].max = Boolean(merged[id].max);
-        if (SECONDARY_IDS.includes(id)) {
-          if (typeof merged[id].opened !== "boolean") {
-            merged[id].opened = !merged[id].min;
-          }
-          merged[id].min = false;
-        }
-        if (merged[id].norm && typeof merged[id].norm === "object") {
-          const n = merged[id].norm;
-          for (const k of ["x", "y", "w", "h"]) {
-            if (typeof n[k] !== "number" || Number.isNaN(n[k])) {
-              merged[id].norm = base[id].norm ? { ...base[id].norm } : undefined;
-              break;
-            }
-          }
-        } else if (base[id].norm) {
-          merged[id].norm = { ...base[id].norm };
-        }
-      }
-    }
-    return merged;
-  } catch {
-    return base;
-  }
-}
-
-function saveWindowLayout() {
-  try {
-    localStorage.setItem(STORAGE_WINDOWS, JSON.stringify(windowLayout));
-  } catch {
-    /* ignore quota */
-  }
-}
-
-function scheduleCanvasResize() {
-  requestAnimationFrame(() => {
-    resizeCanvases();
-    renderMap();
-    renderCameraOverlay();
-  });
-}
-
-function bringWindowToFront(id) {
-  const L = windowLayout[id];
-  if (!L) {
-    return;
-  }
-  zCounter += 1;
-  L.z = zCounter;
-  const el = document.querySelector(`[data-window="${id}"]`);
-  if (el) {
-    el.style.zIndex = String(L.z);
-  }
-  saveWindowLayout();
-}
-
-function applyWindowLayout() {
-  WINDOW_IDS.forEach((id) => {
-    const el = document.querySelector(`[data-window="${id}"]`);
-    const L = windowLayout[id];
-    if (!el || !L) {
-      return;
-    }
-    if (SECONDARY_IDS.includes(id) && L.opened === false) {
-      el.classList.add("float-window--closed");
-      el.setAttribute("aria-hidden", "true");
-      return;
-    }
-    el.classList.remove("float-window--closed");
-    el.setAttribute("aria-hidden", "false");
-
-    el.classList.toggle("minimized", L.min);
-    el.classList.toggle("maximized", L.max);
-    el.style.zIndex = String(L.z || 10);
-
-    if (L.max) {
-      el.style.left = "6px";
-      el.style.top = "6px";
-      el.style.width = "calc(100% - 12px)";
-      el.style.height = "calc(100% - 12px)";
-      return;
-    }
-
-    el.style.left = `${L.x * 100}%`;
-    el.style.top = `${L.y * 100}%`;
-    el.style.width = `${L.w * 100}%`;
-    if (L.min) {
-      el.style.height = "auto";
-    } else {
-      el.style.height = `${L.h * 100}%`;
-    }
-  });
-  scheduleCanvasResize();
-}
-
-function toggleMinimize(id) {
-  const L = windowLayout[id];
-  if (!L) {
-    return;
-  }
-  if (SECONDARY_IDS.includes(id)) {
-    if (!L.opened) {
-      return;
-    }
-    if (L.max) {
-      const r = maxRestore[id];
-      if (r) {
-        L.x = r.x;
-        L.y = r.y;
-        L.w = r.w;
-        L.h = r.h;
-        L.max = false;
-        delete maxRestore[id];
-      }
-    }
-    L.norm = { x: L.x, y: L.y, w: L.w, h: L.h };
-    L.opened = false;
-    L.min = false;
-    L.max = false;
-    saveWindowLayout();
-    applyWindowLayout();
-    return;
-  }
-
-  if (L.min) {
-    L.min = false;
-    L.max = false;
-    if (L.norm) {
-      L.x = L.norm.x;
-      L.y = L.norm.y;
-      L.w = L.norm.w;
-      L.h = L.norm.h;
-    }
-  } else {
-    if (L.max) {
-      const r = maxRestore[id];
-      if (r) {
-        L.x = r.x;
-        L.y = r.y;
-        L.w = r.w;
-        L.h = r.h;
-        L.max = false;
-        delete maxRestore[id];
-      }
-    }
-    L.norm = { x: L.x, y: L.y, w: L.w, h: L.h };
-    L.min = true;
-    L.max = false;
-  }
-  saveWindowLayout();
-  applyWindowLayout();
-}
-
-function toggleMaximize(id) {
-  const L = windowLayout[id];
-  if (!L) {
-    return;
-  }
-  if (L.max) {
-    L.max = false;
-    const r = maxRestore[id];
-    if (r) {
-      L.x = r.x;
-      L.y = r.y;
-      L.w = r.w;
-      L.h = r.h;
-      delete maxRestore[id];
-    }
-    L.min = false;
-  } else {
-    maxRestore[id] = { x: L.x, y: L.y, w: L.w, h: L.h };
-    L.max = true;
-    L.min = false;
-  }
-  saveWindowLayout();
-  applyWindowLayout();
-}
-
-function restoreAndFocus(id) {
-  const L = windowLayout[id];
-  if (!L) {
-    return;
-  }
-  if (SECONDARY_IDS.includes(id)) {
-    L.opened = true;
-    if (L.norm) {
-      L.x = L.norm.x;
-      L.y = L.norm.y;
-      L.w = L.norm.w;
-      L.h = L.norm.h;
-    }
-  } else if (L.norm && L.min) {
-    L.x = L.norm.x;
-    L.y = L.norm.y;
-    L.w = L.norm.w;
-    L.h = L.norm.h;
-  }
-  L.min = false;
-  L.max = false;
-  bringWindowToFront(id);
-  saveWindowLayout();
-  applyWindowLayout();
-}
-
-function initFloatingWindows() {
-  windowLayout = loadWindowLayout();
-  zCounter = Math.max(
-    30,
-    ...WINDOW_IDS.map((id) => windowLayout[id]?.z || 0),
-  );
-  applyWindowLayout();
-
-  const workspace = document.getElementById("window-workspace");
-  if (!workspace) {
-    return;
-  }
-
-  workspace.querySelectorAll(".float-window").forEach((winEl) => {
-    winEl.addEventListener("pointerdown", () => {
-      const id = winEl.dataset.window;
-      if (id) {
-        bringWindowToFront(id);
-      }
-    });
-
-    const head = winEl.querySelector("[data-drag-handle]");
-    if (!head) {
-      return;
-    }
-
-    head.addEventListener("pointerdown", (e) => {
-      if (e.target.closest(".win-btn")) {
-        return;
-      }
-      const id = winEl.dataset.window;
-      if (!id || !windowLayout[id]) {
-        return;
-      }
-      bringWindowToFront(id);
-      const L = windowLayout[id];
-      if (L.max) {
-        toggleMaximize(id);
-      }
-      const rect = workspace.getBoundingClientRect();
-      dragState = {
-        id,
-        startX: e.clientX,
-        startY: e.clientY,
-        origX: L.x,
-        origY: L.y,
-        wsW: rect.width,
-        wsH: rect.height,
-      };
-      head.setPointerCapture(e.pointerId);
-    });
-
-    head.addEventListener("pointermove", (e) => {
-      if (!dragState || dragState.id !== winEl.dataset.window) {
-        return;
-      }
-      const L = windowLayout[dragState.id];
-      if (!L || L.max) {
-        return;
-      }
-      const rect = workspace.getBoundingClientRect();
-      const dx = (e.clientX - dragState.startX) / rect.width;
-      const dy = (e.clientY - dragState.startY) / rect.height;
-      let nx = dragState.origX + dx;
-      let ny = dragState.origY + dy;
-      const boxH = L.min ? 0.04 : L.h;
-      nx = clamp(nx, 0, Math.max(0, 1 - L.w));
-      ny = clamp(ny, 0, Math.max(0, 1 - boxH));
-      L.x = nx;
-      L.y = ny;
-      applyWindowLayout();
-    });
-
-    head.addEventListener("pointerup", (e) => {
-      if (dragState && dragState.id === winEl.dataset.window) {
-        saveWindowLayout();
-        dragState = null;
-      }
-      try {
-        head.releasePointerCapture(e.pointerId);
-      } catch {
-        /* ignore */
-      }
-    });
-
-    head.addEventListener("pointercancel", () => {
-      if (dragState && dragState.id === winEl.dataset.window) {
-        saveWindowLayout();
-        dragState = null;
-      }
-    });
-
-    winEl.querySelector(".win-min")?.addEventListener("click", (e) => {
-      e.stopPropagation();
-      toggleMinimize(winEl.dataset.window);
-    });
-    winEl.querySelector(".win-max")?.addEventListener("click", (e) => {
-      e.stopPropagation();
-      toggleMaximize(winEl.dataset.window);
-    });
-  });
-
-  document.querySelectorAll("[data-launch]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const id = btn.dataset.launch;
-      if (id && WINDOW_IDS.includes(id)) {
-        restoreAndFocus(id);
-      }
-    });
-  });
-
-  document.getElementById("reset-windows-btn")?.addEventListener("click", () => {
-    windowLayout = defaultWindowLayout();
-    for (const k of Object.keys(maxRestore)) {
-      delete maxRestore[k];
-    }
-    saveWindowLayout();
-    applyWindowLayout();
-  });
-
-  if (typeof ResizeObserver !== "undefined") {
-    const ro = new ResizeObserver(() => {
-      scheduleCanvasResize();
-    });
-    ro.observe(workspace);
-  }
 }
 
 function bindEvents() {
-  elements.mapModeButtons.forEach((button) => {
-    button.addEventListener("click", () => {
-      dashboardState.mapMode = button.dataset.mapMode;
-      elements.mapModeButtons.forEach((candidate) => {
-        candidate.classList.toggle("active", candidate === button);
-      });
-      updateMapModeLabel();
-    });
-  });
-
-  document.getElementById("goto-button").addEventListener("click", async () => {
-    const waypoint = elements["waypoint-select"].value;
+  elements["goto-button"].addEventListener("click", async () => {
+    const waypoint = dashboardState.selectedWaypoint || elements["waypoint-select"].value;
     if (!waypoint) {
       return;
     }
+    dashboardState.selectedWaypoint = waypoint;
     await postJson("/command", { cmd: "goto", waypoint });
   });
-  document.getElementById("reload-waypoints-button").addEventListener("click", refreshWaypoints);
-  document.getElementById("refresh-config-button").addEventListener("click", refreshConfig);
-  document.getElementById("save-config-button").addEventListener("click", saveConfig);
-  document.getElementById("stop-button").addEventListener("click", () => postJson("/command", { cmd: "stop" }));
-  document.getElementById("arm-voice-start-button").addEventListener("click", startArmVoiceTest);
-  document.getElementById("arm-voice-stop-button").addEventListener("click", stopArmVoiceTest);
-  document.getElementById("pickup-refresh-button").addEventListener("click", refreshPickupDetection);
-  document.getElementById("pickup-start-button").addEventListener("click", startPickup);
-  document.getElementById("pickup-stop-button").addEventListener("click", stopPickup);
-  document.getElementById("clear-log-view-button").addEventListener("click", () => {
-    dashboardState.visibleLogs = [];
-    renderLogs();
+
+  elements["waypoint-select"].addEventListener("change", () => {
+    dashboardState.selectedWaypoint = elements["waypoint-select"].value || "";
   });
 
-  elements.teleopButtons.forEach((button) => {
-    const preset = button.dataset.teleop || button.getAttribute("data-teleop");
-    const vector = teleopPreset(preset);
-    const start = () => startTeleopPulse(vector);
-    const stop = () => stopTeleopPulse();
-    button.addEventListener("mousedown", start);
-    button.addEventListener("mouseup", stop);
-    button.addEventListener("mouseleave", stop);
-    button.addEventListener("touchstart", (e) => {
-      e.preventDefault();
-      start();
-    }, { passive: false });
-    button.addEventListener("touchend", stop);
+  elements["reload-waypoints-button"].addEventListener("click", () => {
+    refreshWaypoints();
   });
 
-  setupJoystick();
-  setupKeyboardTeleop();
+  elements["listen-target-button"].addEventListener("click", () => {
+    listenForTarget();
+  });
+
+  elements["set-target-button"].addEventListener("click", () => {
+    setTargetLabel();
+  });
+
+  elements["clear-target-button"].addEventListener("click", () => {
+    clearTargetLabel();
+  });
+
+  elements["map-mode-goal-button"].addEventListener("click", () => {
+    setMapMode("goal");
+  });
+
+  elements["map-mode-waypoint-button"].addEventListener("click", () => {
+    setMapMode("waypoint");
+  });
+
+  elements["stop-button"].addEventListener("click", () => {
+    postJson("/command", { cmd: "stop" }).catch(console.error);
+  });
+
+  elements["arm-voice-start-button"].addEventListener("click", () => {
+    startArmVoiceTest();
+  });
+  elements["arm-voice-stop-button"].addEventListener("click", () => {
+    stopArmVoiceTest();
+  });
+
+  elements["pickup-refresh-button"].addEventListener("click", () => {
+    refreshPickupDetection();
+  });
+  elements["pickup-start-button"].addEventListener("click", () => {
+    startPickup();
+  });
+  elements["pickup-stop-button"].addEventListener("click", () => {
+    stopPickup();
+  });
+
   setupMapInteractions();
 }
 
@@ -567,12 +149,14 @@ function connectWebSocket() {
   if (dashboardState.ws) {
     dashboardState.ws.close();
   }
+
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${protocol}://${window.location.host}/ws`);
   dashboardState.ws = ws;
 
   ws.addEventListener("open", () => {
     window.clearTimeout(dashboardState.reconnectTimer);
+    restartCameraStream();
   });
 
   ws.addEventListener("message", (event) => {
@@ -582,9 +166,6 @@ function connectWebSocket() {
         return;
       }
       dashboardState.snapshot = message.data;
-      dashboardState.visibleLogs = Array.isArray(message.data.logs)
-        ? message.data.logs.slice(-MAX_LOGS)
-        : [];
       renderAll();
     } catch (error) {
       console.error("Invalid WebSocket payload", error);
@@ -592,24 +173,26 @@ function connectWebSocket() {
   });
 
   ws.addEventListener("close", () => {
+    scheduleCameraStreamRetry(1500);
     dashboardState.reconnectTimer = window.setTimeout(connectWebSocket, 1500);
   });
 }
 
 function renderAll() {
   renderMeta();
-  renderTelemetry();
-  renderSubsystems();
-  renderObstacles();
-  renderLandmarks();
-  renderVoice();
-  renderGoal();
-  renderArmVoice();
-  renderPickup();
-  renderConfig();
+  renderSummary();
+  renderPlannerBanner();
+  renderWaypoints();
+  renderTargetCard();
+  renderMapModeControls();
+  renderLidarCard();
+  renderPidCard();
+  renderImuCard();
+  renderArmCard();
+  renderSystems();
   renderLogs();
   renderMap();
-  renderCameraOverlay();
+  renderLidarCanvas();
 }
 
 function renderMeta() {
@@ -618,244 +201,313 @@ function renderMeta() {
     return;
   }
   const meta = snapshot.meta || {};
-  elements["robot-name"].textContent = meta.robot_name || "Wheelchair";
+  elements["robot-name"].textContent = meta.robot_name || "Wheelchair Dashboard";
   elements["snapshot-rate"].textContent = `${formatNumber(meta.snapshot_rate_hz || 0, 0)} Hz`;
   const live = Boolean(meta.live);
   const label = meta.connection_label || (live ? "Live" : "Offline");
   setPillState(elements["connection-pill"], live ? "status-live" : "status-offline", label);
 }
 
-function renderTelemetry() {
+function renderSummary() {
   const snapshot = dashboardState.snapshot;
   if (!snapshot) {
     return;
   }
-  const pose = snapshot.pose || {};
-  const velocity = snapshot.velocity || {};
   const nav = snapshot.nav_state || {};
-  const imu = snapshot.imu || {};
-  elements["pose-xyz"].textContent = `${formatNumber(pose.x)}, ${formatNumber(pose.y)}, ${formatNumber(pose.theta)}`;
-  elements["pose-vel-line"].textContent = `${formatNumber(velocity.vx)}, ${formatNumber(velocity.vy)}, ${formatNumber(velocity.omega)}`;
-  elements["nav-line"].textContent = `${nav.state || "Idle"} · ${nav.mode || "manual"}`;
-  elements["nav-estop"].textContent = nav.estop ? "ACTIVE" : "Clear";
-  elements["imu-gyro-z"].textContent = `${formatNumber(imu.gyro_z)} rad/s`;
+  const goal = snapshot.goal || null;
+  elements["nav-state-summary"].textContent = nav.state || "Idle";
+  elements["nav-mode-summary"].textContent = `${nav.mode || "manual"} · E-stop ${nav.estop ? "ACTIVE" : "clear"}`;
+  elements["goal-summary"].textContent = goal
+    ? `${goal.label ? `${goal.label} · ` : ""}${formatNumber(goal.x)}, ${formatNumber(goal.y)}`
+    : "No goal";
 }
 
-function renderSubsystems() {
+function renderPlannerBanner() {
   const snapshot = dashboardState.snapshot;
-  const container = elements["subsystems-tree"];
-  if (!snapshot || !container) {
+  const banner = elements["planner-banner"];
+  if (!snapshot || !banner) {
     return;
   }
-  const subsystems = snapshot.subsystems || {};
-  const markup = Object.entries(subsystems).map(([name, subsystem]) => {
-    const statusClass = statusClassFor(subsystem.status);
-    return `
-      <div class="tree-item">
-        <span class="tree-icon">${escapeHtml(subsystem.icon || name.slice(0, 2).toUpperCase())}</span>
-        <div>
-          <div class="tree-title">${escapeHtml(name)}</div>
-          <div class="tree-detail">${escapeHtml(subsystem.detail || "")}</div>
-        </div>
-        <span class="status-pill ${statusClass}">${escapeHtml(humanizeStatus(subsystem.status))}</span>
-      </div>
-    `;
-  }).join("");
-  container.innerHTML = markup || emptyState("No subsystems.");
-}
 
-function renderObstacles() {
-  const snapshot = dashboardState.snapshot;
-  const container = elements["obstacles-list"];
-  if (!snapshot || !container) {
-    return;
-  }
-  const obstacles = snapshot.obstacles || [];
-  if (!obstacles.length) {
-    container.innerHTML = emptyState("None.");
-    return;
-  }
-  container.innerHTML = obstacles.map((obstacle) => `
-    <div class="list-item">
-      <div>
-        <div class="list-title">Obstacle</div>
-        <div class="list-detail">${formatNumber(obstacle.distance_m)} m · ${formatNumber(obstacle.angle_deg)}°</div>
-      </div>
-      <div class="list-metric">${Math.round((obstacle.confidence || 0) * 100)}%</div>
-    </div>
-  `).join("");
-}
-
-function renderLandmarks() {
-  const snapshot = dashboardState.snapshot;
-  const container = elements["landmarks-list"];
-  if (!snapshot || !container) {
-    return;
-  }
-  const landmarks = snapshot.landmarks || [];
-  if (!landmarks.length) {
-    container.innerHTML = emptyState("None.");
-    return;
-  }
-  container.innerHTML = landmarks.map((landmark) => `
-    <div class="list-item">
-      <div>
-        <div class="list-title">${escapeHtml(landmark.name || "—")}</div>
-        <div class="list-detail">${formatNumber(landmark.x)}, ${formatNumber(landmark.y)}</div>
-      </div>
-      <div class="list-metric">${Math.round((landmark.confidence || 0) * 100)}%</div>
-    </div>
-  `).join("");
-}
-
-function renderVoice() {
-  const snapshot = dashboardState.snapshot;
-  if (!snapshot) {
-    return;
-  }
-  const voice = snapshot.voice || {};
-  elements["voice-transcript"].textContent = voice.transcript || "—";
-  elements["voice-response"].textContent = voice.response || "—";
-}
-
-function renderGoal() {
-  const snapshot = dashboardState.snapshot;
-  if (!snapshot) {
-    return;
-  }
-  const goal = snapshot.goal;
   const nav = snapshot.nav_state || {};
-  const meta = snapshot.meta || {};
-  const q = `${meta.pending_commands || 0} cmd · ${meta.pending_landmarks || 0} lm`;
-  if (!goal) {
-    elements["goal-summary"].textContent = `No goal · ${q}`;
+  const logs = snapshot.logs || [];
+  const goal = snapshot.goal || null;
+  const path = snapshot.path || [];
+  const latest = [...logs].reverse().find((entry) => ["planner", "safety"].includes(String(entry.source || "")));
+  let tone = "idle";
+  let text = "Idle · click the map or press Go.";
+
+  if (nav.estop) {
+    tone = "error";
+    text = "E-stop active. Commands are blocked.";
+  } else if (latest) {
+    const message = String(latest.message || "");
+    const lower = message.toLowerCase();
+    if (lower.includes("goal cell is blocked")) {
+      tone = "warn";
+      text = "Goal blocked by inflated costmap.";
+    } else if (lower.includes("could not find a path") || lower.includes("no path")) {
+      tone = "warn";
+      text = "No path found from the current local map.";
+    } else if (lower.includes("arrived")) {
+      tone = "success";
+      text = "Arrived at goal.";
+    } else if (lower.includes("emergency stop")) {
+      tone = "error";
+      text = message;
+    } else if (lower.includes("passed tracked obstacle cluster") || lower.includes("refresh")) {
+      tone = "active";
+      text = "Refreshing scan after obstacle pass or obstruction.";
+    } else if (lower.includes("planned")) {
+      tone = "success";
+      text = message;
+    } else if (lower.includes("preview-only mode")) {
+      tone = "success";
+      text = "Path preview ready. No motion commands are being sent.";
+    } else if (lower.includes("goal received")) {
+      tone = "active";
+      text = "Goal accepted. Planning path...";
+    } else if (lower.includes("scanning")) {
+      tone = "active";
+      text = message;
+    }
+  }
+
+  if (nav.state === "Planning") {
+    tone = "active";
+    text = "Planning A* path...";
+  } else if (nav.state === "Target Search") {
+    tone = "active";
+    text = "Rotating to center the visible target in the camera box.";
+  } else if (nav.state === "Path Ready") {
+    tone = "success";
+    text = path.length > 1
+      ? `Path preview ready · ${path.length} waypoints`
+      : "Path preview ready.";
+  } else if (nav.state === "Moving") {
+    tone = "success";
+    text = path.length > 1
+      ? `Following path · ${path.length} waypoints`
+      : "Moving toward goal.";
+  } else if (nav.state && nav.state.toLowerCase().includes("scanning")) {
+    tone = "active";
+    text = `${nav.state}. Building local map...`;
+  } else if (goal && path.length > 1) {
+    tone = "success";
+    text = `Path ready · ${path.length} waypoints`;
+  } else if (goal && tone === "idle") {
+    tone = "active";
+    text = `Goal set · ${formatNumber(goal.x)}, ${formatNumber(goal.y)}`;
+  }
+
+  banner.className = `planner-banner planner-banner--${tone}`;
+  banner.textContent = text;
+}
+
+function renderWaypoints() {
+  const snapshot = dashboardState.snapshot;
+  const select = elements["waypoint-select"];
+  if (!snapshot || !select) {
+    return;
+  }
+  const waypoints = snapshot.waypoints || {};
+  const current = dashboardState.selectedWaypoint || select.value;
+  const entries = Object.entries(waypoints).sort(([left], [right]) => left.localeCompare(right));
+  if (!entries.length) {
+    select.innerHTML = `<option value="">No waypoints</option>`;
+    select.disabled = true;
+    elements["goto-button"].disabled = true;
+    dashboardState.selectedWaypoint = "";
+    return;
+  }
+
+  select.disabled = false;
+  elements["goto-button"].disabled = false;
+  select.innerHTML = entries.map(([name, coords]) =>
+    `<option value="${escapeAttribute(name)}">${escapeHtml(name)} (${formatNumber(coords[0])}, ${formatNumber(coords[1])})</option>`,
+  ).join("");
+  if (current && waypoints[current]) {
+    select.value = current;
   } else {
-    const label = goal.label ? `${goal.label} · ` : "";
-    elements["goal-summary"].textContent = `${label}${formatNumber(goal.x)}, ${formatNumber(goal.y)} · ${nav.state || "Idle"} · ${q}`;
+    select.value = entries[0][0];
   }
+  dashboardState.selectedWaypoint = select.value || "";
 }
 
-function renderArmVoice() {
+function renderTargetCard() {
   const snapshot = dashboardState.snapshot;
   if (!snapshot) {
     return;
   }
+
+  const objectTarget = snapshot.object_target || {};
+  const label = String(objectTarget.label || "").trim();
+  const detection = objectTarget.detection || null;
+  const status = String(objectTarget.status || "idle");
+  const listening = Boolean(objectTarget.listening);
+  let detail = objectTarget.detail || "Click Listen or Set to choose an object.";
+
+  if (detection) {
+    const angle = Number(detection.angle_deg || 0);
+    detail = `${detection.label} ${formatNumber(detection.confidence)} at ${formatNumber(angle, 0)} deg`;
+  } else if (objectTarget.transcript) {
+    detail = `${detail} Heard: "${objectTarget.transcript}"`;
+  }
+  if (objectTarget.waypoint_name) {
+    detail = `${detail} Saved waypoint: ${objectTarget.waypoint_name}`;
+  }
+
+  elements["object-target-label"].textContent = label || "No target";
+  elements["object-target-detail"].textContent = detail;
+  elements["listen-target-button"].disabled = listening;
+  elements["set-target-button"].disabled = listening;
+  elements["clear-target-button"].disabled = !label && status === "idle";
+}
+
+function renderMapModeControls() {
+  const chip = elements["map-mode-chip"];
+  const goalButton = elements["map-mode-goal-button"];
+  const waypointButton = elements["map-mode-waypoint-button"];
+  const isWaypoint = dashboardState.mapMode === "waypoint";
+
+  if (chip) {
+    chip.textContent = isWaypoint ? "Waypoint" : "Goal";
+    chip.className = `status-pill ${isWaypoint ? "status-warn" : "status-connected"}`;
+  }
+  if (goalButton) {
+    goalButton.classList.toggle("button-active", !isWaypoint);
+  }
+  if (waypointButton) {
+    waypointButton.classList.toggle("button-active", isWaypoint);
+  }
+}
+
+function renderLidarCard() {
+  const snapshot = dashboardState.snapshot;
+  if (!snapshot) {
+    return;
+  }
+
+  const lidarSubsystem = (snapshot.subsystems || {})["LiDAR"] || {};
+  const lidarScan = snapshot.lidar_scan || {};
+  const map = snapshot.occupancy_grid || {};
+  const obstacles = snapshot.obstacles || [];
+  const points = lidarScan.xy_points || [];
+
+  setPillState(
+    elements["lidar-pill"],
+    statusClassFor(lidarSubsystem.status || "disconnected"),
+    humanizeStatus(lidarSubsystem.status || "disconnected"),
+  );
+  elements["lidar-points"].textContent = String(points.length);
+  elements["lidar-obstacles"].textContent = String(obstacles.length);
+  elements["lidar-map-shape"].textContent = map.shape ? `${map.shape[0]} x ${map.shape[1]}` : "0 x 0";
+  elements["lidar-detail"].textContent = lidarSubsystem.detail || "Waiting for scan data.";
+}
+
+function renderPidCard() {
+  const snapshot = dashboardState.snapshot;
+  if (!snapshot) {
+    return;
+  }
+  const velocity = snapshot.velocity || {};
+  const pose = snapshot.pose || {};
+  const nav = snapshot.nav_state || {};
+
+  elements["pid-command"].textContent = `${formatNumber(velocity.vx)}, ${formatNumber(velocity.vy)}, ${formatNumber(velocity.omega)}`;
+  elements["pid-pose"].textContent = `${formatNumber(pose.x)}, ${formatNumber(pose.y)}, ${formatNumber(pose.theta)}`;
+  elements["pid-estop"].textContent = nav.estop ? "ACTIVE" : "Clear";
+  elements["pid-note"].textContent = nav.estop
+    ? "E-stop is active. PID slot reserved for wheel tuning and encoder feedback."
+    : "Slot reserved for wheel PID, encoder feedback, and tuning plots.";
+}
+
+function renderImuCard() {
+  const snapshot = dashboardState.snapshot;
+  if (!snapshot) {
+    return;
+  }
+
+  const subsystem = (snapshot.subsystems || {})["IMU"] || {};
+  const imu = snapshot.imu || {};
+  const receiving = Boolean(imu.receiving);
+  const age = imu.packet_age_s;
+
+  setPillState(
+    elements["imu-pill"],
+    statusClassFor(subsystem.status || (receiving ? "connected" : "disconnected")),
+    humanizeStatus(subsystem.status || (receiving ? "connected" : "disconnected")),
+  );
+
+  elements["imu-status"].textContent = receiving ? "Receiving packets" : "Waiting for packets";
+  elements["imu-gyro"].textContent = `${formatNumber(imu.gyro_x)}, ${formatNumber(imu.gyro_y)}, ${formatNumber(imu.gyro_z)}`;
+  elements["imu-accel"].textContent = `${formatNumber(imu.accel_x)}, ${formatNumber(imu.accel_y)}, ${formatNumber(imu.accel_z)}`;
+  elements["imu-age"].textContent = age == null ? "n/a" : `${formatNumber(age, 2)} s`;
+  elements["imu-note"].textContent = subsystem.detail || "Waiting for HyperIMU UDP on port 5555.";
+}
+
+function renderArmCard() {
+  const snapshot = dashboardState.snapshot;
+  if (!snapshot) {
+    return;
+  }
+
   const armVoice = snapshot.arm_voice || {};
-  const status = armVoice.status || "idle";
-  const running = Boolean(armVoice.running);
-  setPillState(elements["arm-voice-pill"], statusClassFor(status), humanizeStatus(status));
-  elements["arm-voice-detail"].textContent = armVoice.detail || "Start, then speak.";
-  elements["arm-voice-start-button"].disabled = running || status === "starting";
-  elements["arm-voice-stop-button"].disabled = !(running || status === "starting" || status === "stopping");
-}
+  const armStatus = armVoice.status || "idle";
+  const armRunning = Boolean(armVoice.running);
+  setPillState(elements["arm-voice-pill"], statusClassFor(armStatus), humanizeStatus(armStatus));
+  elements["arm-voice-detail"].textContent = armVoice.detail || "Arm voice idle.";
+  elements["arm-voice-start-button"].disabled = armRunning || armStatus === "starting";
+  elements["arm-voice-stop-button"].disabled = !(armRunning || armStatus === "starting" || armStatus === "stopping");
 
-function renderPickup() {
-  const snapshot = dashboardState.snapshot;
-  if (!snapshot) {
-    return;
-  }
   const pickup = snapshot.pickup || {};
-  const status = pickup.status || "idle";
-  const running = Boolean(pickup.running);
-  setPillState(elements["pickup-pill"], statusClassFor(status), humanizeStatus(status));
-  elements["pickup-detail"].textContent = pickup.detail || "—";
-  elements["pickup-refresh-button"].disabled = running;
-  elements["pickup-start-button"].disabled = running;
-  elements["pickup-stop-button"].disabled = !running;
+  const pickupStatus = pickup.status || "idle";
+  const pickupRunning = Boolean(pickup.running);
+  setPillState(elements["pickup-pill"], statusClassFor(pickupStatus), humanizeStatus(pickupStatus));
+  elements["pickup-detail"].textContent = pickup.detail || "Pickup idle.";
+  elements["pickup-refresh-button"].disabled = pickupRunning;
+  elements["pickup-start-button"].disabled = pickupRunning;
+  elements["pickup-stop-button"].disabled = !pickupRunning;
 }
 
-function renderConfig() {
+function renderSystems() {
   const snapshot = dashboardState.snapshot;
-  const container = elements["config-form"];
+  const container = elements["subsystems-list"];
   if (!snapshot || !container) {
     return;
   }
-  const config = snapshot.config || {};
-  const configMeta = snapshot.config_meta || {};
-  if (elements["config-note"]) {
-    elements["config-note"].textContent = configMeta.save_note || "";
-  }
-  const hash = JSON.stringify(config);
-  if (hash === dashboardState.configRenderedHash) {
-    return;
-  }
-  dashboardState.configRenderedHash = hash;
-  const preferredOrder = ["serial", "lidar", "slam", "planner", "safety", "camera", "pickup", "ekf", "phone_imu"];
-  const sections = Object.keys(config).sort((a, b) => {
-    const ai = preferredOrder.indexOf(a);
-    const bi = preferredOrder.indexOf(b);
-    if (ai === -1 && bi === -1) {
-      return a.localeCompare(b);
-    }
-    if (ai === -1) {
-      return 1;
-    }
-    if (bi === -1) {
-      return -1;
-    }
-    return ai - bi;
-  });
-  container.innerHTML = sections.map((name) => renderConfigSection(name, config[name] || {})).join("");
-}
 
-function renderConfigSection(sectionName, sectionConfig) {
-  const fields = Object.entries(sectionConfig).map(([key, value]) => {
-    const label = `
+  const subsystems = snapshot.subsystems || {};
+  const rows = Object.entries(subsystems).map(([name, subsystem]) => `
+    <div class="system-row">
       <div>
-        <div class="config-key">${escapeHtml(key)}</div>
-        <div class="config-helper">${escapeHtml(sectionName)}</div>
+        <div class="system-name">${escapeHtml(name)}</div>
+        <div class="system-detail">${escapeHtml(subsystem.detail || "")}</div>
       </div>
-    `;
-    if (typeof value === "boolean") {
-      return `
-        <div class="config-field" data-config-section="${escapeAttribute(sectionName)}" data-config-key="${escapeAttribute(key)}">
-          ${label}
-          <div class="switch-row">
-            <label class="switch">
-              <input type="checkbox" class="config-toggle" ${value ? "checked" : ""} />
-              <span class="switch-slider"></span>
-            </label>
-            <span>${value ? "On" : "Off"}</span>
-          </div>
-        </div>
-      `;
-    }
-    const inputType = typeof value === "number" ? "number" : "text";
-    return `
-      <label class="config-field" data-config-section="${escapeAttribute(sectionName)}" data-config-key="${escapeAttribute(key)}">
-        ${label}
-        <input class="config-input" type="${inputType}" value="${escapeAttribute(String(value))}" ${inputType === "number" ? "step=any" : ""} />
-      </label>
-    `;
-  }).join("");
-
-  return `
-    <section class="config-section">
-      <div class="config-section-header">${escapeHtml(capitalize(sectionName))}</div>
-      <div class="config-section-body">${fields || emptyState("No fields")}</div>
-    </section>
-  `;
+      <span class="status-pill ${statusClassFor(subsystem.status)}">${escapeHtml(humanizeStatus(subsystem.status))}</span>
+    </div>
+  `).join("");
+  container.innerHTML = rows || emptyState("No subsystem data.");
 }
 
 function renderLogs() {
   const container = elements["log-viewer"];
-  const logs = dashboardState.visibleLogs || [];
+  if (!container) {
+    return;
+  }
+  const logs = ((dashboardState.snapshot || {}).logs || []).slice(-MAX_LOGS);
   if (!logs.length) {
     container.innerHTML = emptyState("No logs yet.");
     return;
   }
-  const nearBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - 24;
   container.innerHTML = logs.map((entry) => `
     <div class="log-entry">
       <span>${escapeHtml(entry.ts || "")}</span>
-      <span class="log-level" style="color:${escapeAttribute(entry.color || "#60a5fa")}">${escapeHtml(entry.level || "INFO")}</span>
+      <span style="color:${escapeAttribute(entry.color || "#60a5fa")}; font-weight:700;">${escapeHtml(entry.level || "INFO")}</span>
       <span>${escapeHtml(entry.source || "")}</span>
       <span>${escapeHtml(entry.message || "")}</span>
     </div>
   `).join("");
-  if (nearBottom) {
-    container.scrollTop = container.scrollHeight;
-  }
 }
 
 function renderMap() {
@@ -864,19 +516,21 @@ function renderMap() {
   if (!snapshot || !canvas) {
     return;
   }
+
   const ctx = canvas.getContext("2d");
   const width = canvas.clientWidth || canvas.width;
   const height = canvas.clientHeight || canvas.height;
   ctx.clearRect(0, 0, width, height);
-  ctx.fillStyle = "#0b0d10";
+  ctx.fillStyle = `rgb(${MAP_EMPTY_SHADE}, ${MAP_EMPTY_SHADE}, ${MAP_EMPTY_SHADE})`;
   ctx.fillRect(0, 0, width, height);
 
   const map = snapshot.occupancy_grid || {};
   drawOccupancyGrid(ctx, canvas, map);
   drawPath(ctx, canvas, map, snapshot.path || []);
-  drawLidar(ctx, canvas, map, snapshot.pose || {}, snapshot.lidar_scan || {});
-  drawObstaclesMap(ctx, canvas, map, snapshot.pose || {}, snapshot.obstacles || []);
-  drawLandmarksMap(ctx, canvas, map, snapshot.pose || {}, snapshot.landmarks || []);
+  drawLidarOnMap(ctx, canvas, map, snapshot.pose || {}, snapshot.lidar_scan || {});
+  drawObstaclesOnMap(ctx, canvas, map, snapshot.obstacles || []);
+  drawVoiceTargetOnMap(ctx, canvas, map, snapshot.pose || {}, snapshot.object_target || {});
+  drawWaypoints(ctx, canvas, map, snapshot.waypoints || {});
   drawGoal(ctx, canvas, map, snapshot.goal);
   drawRobot(ctx, canvas, map, snapshot.pose || {});
 }
@@ -886,14 +540,17 @@ function drawOccupancyGrid(ctx, canvas, map) {
   if (!grid.length || !grid[0] || !grid[0].length) {
     return;
   }
+
   const rows = grid.length;
   const cols = grid[0].length;
   const cellWidth = (canvas.clientWidth || canvas.width) / cols;
   const cellHeight = (canvas.clientHeight || canvas.height) / rows;
+  const shadeRange = MAP_EMPTY_SHADE - MAP_OBSTACLE_SHADE;
+
   for (let row = 0; row < rows; row += 1) {
     for (let col = 0; col < cols; col += 1) {
-      const value = Number(grid[row][col]);
-      const shade = Math.max(60, Math.min(220, Math.round(200 - value * 140)));
+      const value = clamp(Number(grid[row][col]) || 0, 0, 1);
+      const shade = Math.round(MAP_EMPTY_SHADE - value * shadeRange);
       ctx.fillStyle = `rgb(${shade}, ${shade}, ${shade})`;
       ctx.fillRect(col * cellWidth, row * cellHeight, cellWidth + 1, cellHeight + 1);
     }
@@ -905,7 +562,7 @@ function drawPath(ctx, canvas, map, path) {
     return;
   }
   ctx.save();
-  ctx.strokeStyle = "#60a5fa";
+  ctx.strokeStyle = "#2563eb";
   ctx.lineWidth = 3;
   ctx.beginPath();
   path.forEach((point, index) => {
@@ -920,15 +577,18 @@ function drawPath(ctx, canvas, map, path) {
   ctx.restore();
 }
 
-function drawLidar(ctx, canvas, map, pose, lidarScan) {
+function drawLidarOnMap(ctx, canvas, map, pose, lidarScan) {
   const points = (lidarScan && lidarScan.xy_points) || [];
+  const frame = String((lidarScan && lidarScan.frame) || "robot").toLowerCase();
   if (!points.length) {
     return;
   }
   ctx.save();
-  ctx.fillStyle = "rgba(61, 214, 140, 0.9)";
+  ctx.fillStyle = "rgba(16, 185, 129, 0.85)";
   points.forEach((point) => {
-    const worldPoint = robotToWorld(point.x, point.y, pose);
+    const worldPoint = frame === "map"
+      ? { x: Number(point.x || 0), y: Number(point.y || 0) }
+      : robotToWorld(point.x, point.y, pose);
     const pixel = worldToCanvas(worldPoint.x, worldPoint.y, map, canvas);
     ctx.beginPath();
     ctx.arc(pixel.x, pixel.y, 2, 0, Math.PI * 2);
@@ -937,17 +597,16 @@ function drawLidar(ctx, canvas, map, pose, lidarScan) {
   ctx.restore();
 }
 
-function drawObstaclesMap(ctx, canvas, map, pose, obstacles) {
+function drawObstaclesOnMap(ctx, canvas, map, obstacles) {
   if (!obstacles.length) {
     return;
   }
   ctx.save();
-  ctx.strokeStyle = "#f87171";
-  ctx.fillStyle = "rgba(248, 113, 113, 0.12)";
+  ctx.strokeStyle = "#b91c1c";
+  ctx.fillStyle = "rgba(185, 28, 28, 0.16)";
   obstacles.forEach((obstacle) => {
-    const worldPoint = robotToWorld(obstacle.x, obstacle.y, pose);
-    const pixel = worldToCanvas(worldPoint.x, worldPoint.y, map, canvas);
-    const radiusPx = Math.max(6, obstacle.radius / Math.max(map.resolution_m || 0.1, 0.01));
+    const pixel = worldToCanvas(obstacle.x, obstacle.y, map, canvas);
+    const radiusPx = Math.max(6, Number(obstacle.radius || 0.2) / Math.max(Number(map.resolution_m || 0.1), 0.01));
     ctx.beginPath();
     ctx.arc(pixel.x, pixel.y, radiusPx, 0, Math.PI * 2);
     ctx.fill();
@@ -956,26 +615,54 @@ function drawObstaclesMap(ctx, canvas, map, pose, obstacles) {
   ctx.restore();
 }
 
-function drawLandmarksMap(ctx, canvas, map, pose, landmarks) {
-  if (!landmarks.length) {
+function drawWaypoints(ctx, canvas, map, waypoints) {
+  const entries = Object.entries(waypoints || {});
+  if (!entries.length) {
     return;
   }
+
   ctx.save();
-  ctx.fillStyle = "#e8eaed";
-  ctx.font = "11px Inter, system-ui, sans-serif";
-  landmarks.forEach((landmark) => {
-    const point = landmark.frame === "robot"
-      ? robotToWorld(landmark.x, landmark.y, pose)
-      : { x: landmark.x, y: landmark.y };
-    const pixel = worldToCanvas(point.x, point.y, map, canvas);
+  ctx.font = "12px Inter, system-ui, sans-serif";
+  ctx.textBaseline = "top";
+  entries.forEach(([name, coords]) => {
+    const pixel = worldToCanvas(coords[0], coords[1], map, canvas);
+    ctx.fillStyle = "#7c3aed";
     ctx.beginPath();
-    ctx.moveTo(pixel.x, pixel.y - 8);
-    ctx.lineTo(pixel.x - 6, pixel.y + 5);
-    ctx.lineTo(pixel.x + 6, pixel.y + 5);
-    ctx.closePath();
+    ctx.arc(pixel.x, pixel.y, 6, 0, Math.PI * 2);
     ctx.fill();
-    ctx.fillText(landmark.name || "", pixel.x + 8, pixel.y + 2);
+
+    ctx.fillStyle = "rgba(124, 58, 237, 0.14)";
+    ctx.fillRect(pixel.x + 10, pixel.y - 2, Math.max(54, name.length * 7), 18);
+    ctx.fillStyle = "#ede9fe";
+    ctx.fillText(name, pixel.x + 14, pixel.y + 1);
   });
+  ctx.restore();
+}
+
+function drawVoiceTargetOnMap(ctx, canvas, map, pose, objectTarget) {
+  const target = objectTarget && objectTarget.lidar_target;
+  if (!target) {
+    return;
+  }
+
+  const frame = String(target.frame || "map").toLowerCase();
+  const worldPoint = frame === "map"
+    ? { x: Number(target.x || 0), y: Number(target.y || 0) }
+    : robotToWorld(target.x, target.y, pose);
+  const pixel = worldToCanvas(worldPoint.x, worldPoint.y, map, canvas);
+  const radiusPx = Math.max(8, Number(target.radius || 0.2) / Math.max(Number(map.resolution_m || 0.1), 0.01));
+
+  ctx.save();
+  ctx.strokeStyle = "#d946ef";
+  ctx.fillStyle = "rgba(217, 70, 239, 0.18)";
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(pixel.x, pixel.y, radiusPx, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(pixel.x, pixel.y, radiusPx + 10, 0, Math.PI * 2);
+  ctx.stroke();
   ctx.restore();
 }
 
@@ -985,7 +672,7 @@ function drawGoal(ctx, canvas, map, goal) {
   }
   const pixel = worldToCanvas(goal.x, goal.y, map, canvas);
   ctx.save();
-  ctx.strokeStyle = "#38bdf8";
+  ctx.strokeStyle = "#0ea5e9";
   ctx.lineWidth = 3;
   ctx.beginPath();
   ctx.arc(pixel.x, pixel.y, 10, 0, Math.PI * 2);
@@ -1005,7 +692,7 @@ function drawRobot(ctx, canvas, map, pose) {
   ctx.save();
   ctx.translate(pixel.x, pixel.y);
   ctx.rotate(-theta);
-  ctx.fillStyle = "#e8eaed";
+  ctx.fillStyle = "#111827";
   ctx.beginPath();
   ctx.moveTo(16, 0);
   ctx.lineTo(-12, -10);
@@ -1013,6 +700,103 @@ function drawRobot(ctx, canvas, map, pose) {
   ctx.lineTo(-12, 10);
   ctx.closePath();
   ctx.fill();
+  ctx.restore();
+}
+
+function renderLidarCanvas() {
+  const snapshot = dashboardState.snapshot;
+  const canvas = elements["lidar-canvas"];
+  if (!snapshot || !canvas) {
+    return;
+  }
+
+  const ctx = canvas.getContext("2d");
+  const width = canvas.clientWidth || canvas.width;
+  const height = canvas.clientHeight || canvas.height;
+  const centerX = width / 2;
+  const centerY = height / 2;
+  const lidarScan = snapshot.lidar_scan || {};
+  const points = (lidarScan.xy_points || []);
+  const frame = String(lidarScan.frame || "robot").toLowerCase();
+  const pose = snapshot.pose || {};
+  const map = snapshot.occupancy_grid || {};
+  const halfSpanM = Math.max(3, ((Number(map.grid_size || 120) * Number(map.resolution_m || 0.1)) / 2));
+  const scale = (Math.min(width, height) * 0.42) / halfSpanM;
+
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = "#0e1116";
+  ctx.fillRect(0, 0, width, height);
+
+  ctx.save();
+  ctx.strokeStyle = "rgba(255,255,255,0.08)";
+  ctx.lineWidth = 1;
+  for (let ring = 1; ring <= 3; ring += 1) {
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, ring * (Math.min(width, height) * 0.12), 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.beginPath();
+  ctx.moveTo(centerX, 0);
+  ctx.lineTo(centerX, height);
+  ctx.moveTo(0, centerY);
+  ctx.lineTo(width, centerY);
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.save();
+  ctx.fillStyle = "#34d399";
+  points.forEach((point) => {
+    const pointXY = frame === "map"
+      ? worldToRobot(point.x, point.y, pose)
+      : { x: Number(point.x || 0), y: Number(point.y || 0) };
+    const px = centerX + Number(pointXY.y || 0) * scale;
+    const py = centerY - Number(pointXY.x || 0) * scale;
+    ctx.beginPath();
+    ctx.arc(px, py, 1.8, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  ctx.restore();
+
+  ctx.save();
+  ctx.translate(centerX, centerY);
+  ctx.fillStyle = "#e5e7eb";
+  ctx.beginPath();
+  ctx.moveTo(0, -12);
+  ctx.lineTo(-8, 10);
+  ctx.lineTo(0, 5);
+  ctx.lineTo(8, 10);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  drawVoiceTargetOnLidarCanvas(ctx, centerX, centerY, scale, pose, snapshot.object_target || {});
+}
+
+function drawVoiceTargetOnLidarCanvas(ctx, centerX, centerY, scale, pose, objectTarget) {
+  const target = objectTarget && objectTarget.lidar_target;
+  if (!target) {
+    return;
+  }
+
+  const frame = String(target.frame || "map").toLowerCase();
+  const pointXY = frame === "map"
+    ? worldToRobot(target.x, target.y, pose)
+    : { x: Number(target.x || 0), y: Number(target.y || 0) };
+  const px = centerX + Number(pointXY.y || 0) * scale;
+  const py = centerY - Number(pointXY.x || 0) * scale;
+
+  ctx.save();
+  ctx.strokeStyle = "#d946ef";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(px, py, 9, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(px - 12, py);
+  ctx.lineTo(px + 12, py);
+  ctx.moveTo(px, py - 12);
+  ctx.lineTo(px, py + 12);
+  ctx.stroke();
   ctx.restore();
 }
 
@@ -1037,363 +821,61 @@ function setupMapInteractions() {
     const map = snapshot.occupancy_grid || {};
     const rect = canvas.getBoundingClientRect();
     const world = canvasToWorld(event.clientX - rect.left, event.clientY - rect.top, map, canvas);
-    if (dashboardState.mapMode === "goal") {
-      await postJson("/command", { cmd: "goto", x: world.x, y: world.y, label: "map goal" });
-    } else {
-      const name = window.prompt("Landmark name");
-      if (!name) {
+    if (dashboardState.mapMode === "waypoint") {
+      const suggested = `wp-${Date.now().toString().slice(-4)}`;
+      const name = window.prompt("Waypoint name?", suggested);
+      if (!name || !name.trim()) {
         return;
       }
-      await postJson("/landmark", {
-        name,
-        x: world.x,
-        y: world.y,
-        frame: "world",
-        source: "map",
-        descriptor_status: "pending_capture",
-      });
-    }
-  });
-
-  updateMapModeLabel();
-}
-
-function renderCameraOverlay() {
-  const snapshot = dashboardState.snapshot;
-  const overlay = elements["camera-overlay"];
-  const image = elements["camera-stream"];
-  if (!snapshot || !overlay || !image) {
-    return;
-  }
-  const width = image.clientWidth || 640;
-  const height = image.clientHeight || 360;
-  const ratio = window.devicePixelRatio || 1;
-  overlay.width = Math.max(1, Math.floor(width * ratio));
-  overlay.height = Math.max(1, Math.floor(height * ratio));
-  overlay.style.width = `${width}px`;
-  overlay.style.height = `${height}px`;
-  const ctx = overlay.getContext("2d");
-  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-  ctx.clearRect(0, 0, width, height);
-  ctx.strokeStyle = "#3dd68c";
-  ctx.fillStyle = "#3dd68c";
-  ctx.lineWidth = 2;
-  ctx.font = "11px Inter, system-ui, sans-serif";
-
-  const obstacles = snapshot.obstacles || [];
-  obstacles.forEach((obstacle, index) => {
-    const distance = Math.max(0.3, Number(obstacle.distance_m || Math.hypot(obstacle.x, obstacle.y)));
-    const angle = Number(obstacle.angle_deg || (Math.atan2(obstacle.y, obstacle.x) * 180 / Math.PI));
-    const centerX = (0.5 - (angle / 60)) * width;
-    const boxWidth = Math.max(28, 140 / distance);
-    const boxHeight = Math.max(40, 180 / distance);
-    const x = clamp(centerX - boxWidth / 2, 0, width - boxWidth);
-    const y = clamp(height * 0.68 - boxHeight + index * 4, 20, height - boxHeight - 8);
-    ctx.strokeRect(x, y, boxWidth, boxHeight);
-    ctx.fillText(`${formatNumber(distance)}m`, x, Math.max(14, y - 6));
-  });
-
-  const pickup = snapshot.pickup || {};
-  const detection = pickup.last_detection || null;
-  const target = pickup.last_target || null;
-  if (!detection || !detection.image_width || !detection.image_height) {
-    return;
-  }
-  const scaleX = width / Number(detection.image_width || width);
-  const scaleY = height / Number(detection.image_height || height);
-  const x = Number(detection.x_min || 0) * scaleX;
-  const y = Number(detection.y_min || 0) * scaleY;
-  const boxWidth = Math.max(1, Number((detection.x_max || 0) - (detection.x_min || 0)) * scaleX);
-  const boxHeight = Math.max(1, Number((detection.y_max || 0) - (detection.y_min || 0)) * scaleY);
-  const centerX = x + boxWidth / 2;
-  const centerY = y + boxHeight / 2;
-  const ready = pickup.status === "ready" || pickup.status === "success";
-  const stroke = ready ? "#60a5fa" : "#fbbf24";
-  ctx.save();
-  ctx.strokeStyle = stroke;
-  ctx.fillStyle = stroke;
-  ctx.lineWidth = 3;
-  ctx.strokeRect(x, y, boxWidth, boxHeight);
-  ctx.beginPath();
-  ctx.arc(centerX, centerY, 5, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.beginPath();
-  ctx.moveTo(centerX - 12, centerY);
-  ctx.lineTo(centerX + 12, centerY);
-  ctx.moveTo(centerX, centerY - 12);
-  ctx.lineTo(centerX, centerY + 12);
-  ctx.stroke();
-  const label = detection.label || "ball";
-  const confidence = `${Math.round((Number(detection.confidence) || 0) * 100)}%`;
-  const rangeText = target && target.range_m != null ? `${formatNumber(target.range_m)}m` : "n/a";
-  ctx.fillText(`${label} ${confidence} · ${rangeText}`, x, Math.max(16, y - 8));
-  ctx.restore();
-}
-
-function setupJoystick() {
-  const pad = elements["joystick-pad"];
-  const knob = elements["joystick-knob"];
-  const updateJoystick = (clientX, clientY) => {
-    const rect = pad.getBoundingClientRect();
-    const centerX = rect.left + rect.width / 2;
-    const centerY = rect.top + rect.height / 2;
-    const radius = rect.width / 2 - 22;
-    let dx = clientX - centerX;
-    let dy = clientY - centerY;
-    const dist = Math.hypot(dx, dy);
-    if (dist > radius) {
-      dx = (dx / dist) * radius;
-      dy = (dy / dist) * radius;
-    }
-    knob.style.transform = `translate(${dx}px, ${dy}px)`;
-    dashboardState.joystick.vx = Number((-dy / radius) * 0.5);
-    dashboardState.joystick.vy = Number((dx / radius) * 0.25);
-    elements["joystick-readout"].textContent = `vx ${formatNumber(dashboardState.joystick.vx)} · vy ${formatNumber(dashboardState.joystick.vy)}`;
-  };
-  const resetJoystick = () => {
-    dashboardState.joystick.active = false;
-    dashboardState.joystick.pointerId = null;
-    dashboardState.joystick.vx = 0;
-    dashboardState.joystick.vy = 0;
-    knob.style.transform = "translate(0px, 0px)";
-    elements["joystick-readout"].textContent = "vx 0 · vy 0";
-    stopJoystickPulse();
-    postJson("/command", { cmd: "teleop", vx: 0, vy: 0, omega: 0 }).catch(() => {});
-  };
-  pad.addEventListener("pointerdown", (event) => {
-    dashboardState.joystick.active = true;
-    dashboardState.joystick.pointerId = event.pointerId;
-    pad.setPointerCapture(event.pointerId);
-    updateJoystick(event.clientX, event.clientY);
-    startJoystickPulse();
-  });
-  pad.addEventListener("pointermove", (event) => {
-    if (!dashboardState.joystick.active || dashboardState.joystick.pointerId !== event.pointerId) {
+      const savedName = name.trim();
+      dashboardState.selectedWaypoint = savedName;
+      await postJson("/waypoints", { name: savedName, x: world.x, y: world.y });
+      await refreshWaypoints(savedName);
+      setMapMode("goal");
       return;
     }
-    updateJoystick(event.clientX, event.clientY);
+    await postJson("/command", { cmd: "goto", x: world.x, y: world.y, label: "map goal" });
   });
-  ["pointerup", "pointercancel", "lostpointercapture"].forEach((eventName) => {
-    pad.addEventListener(eventName, resetJoystick);
-  });
-}
-
-function startJoystickPulse() {
-  stopJoystickPulse();
-  sendTeleop(dashboardState.joystick.vx, dashboardState.joystick.vy, 0);
-  dashboardState.joystick.interval = window.setInterval(() => {
-    sendTeleop(dashboardState.joystick.vx, dashboardState.joystick.vy, 0);
-  }, 120);
-}
-
-function stopJoystickPulse() {
-  if (dashboardState.joystick.interval) {
-    window.clearInterval(dashboardState.joystick.interval);
-    dashboardState.joystick.interval = null;
-  }
-}
-
-function setupKeyboardTeleop() {
-  const pressed = new Set();
-  const updateVector = () => {
-    const vx = (pressed.has("w") ? 0.45 : 0) + (pressed.has("s") ? -0.45 : 0);
-    const vy = (pressed.has("a") ? 0.22 : 0) + (pressed.has("d") ? -0.22 : 0);
-    dashboardState.keyboardVector = { vx, vy, omega: 0 };
-    if (vx || vy) {
-      if (!dashboardState.keyboardInterval) {
-        sendTeleop(vx, vy, 0);
-        dashboardState.keyboardInterval = window.setInterval(() => {
-          sendTeleop(dashboardState.keyboardVector.vx, dashboardState.keyboardVector.vy, 0);
-        }, 120);
-      }
-    } else if (dashboardState.keyboardInterval) {
-      window.clearInterval(dashboardState.keyboardInterval);
-      dashboardState.keyboardInterval = null;
-      sendTeleop(0, 0, 0);
-    }
-  };
-  window.addEventListener("keydown", (event) => {
-    const key = event.key.toLowerCase();
-    if (!["w", "a", "s", "d"].includes(key)) {
-      return;
-    }
-    pressed.add(key);
-    updateVector();
-  });
-  window.addEventListener("keyup", (event) => {
-    const key = event.key.toLowerCase();
-    if (!["w", "a", "s", "d"].includes(key)) {
-      return;
-    }
-    pressed.delete(key);
-    updateVector();
-  });
-}
-
-function startTeleopPulse(vector) {
-  stopTeleopPulse();
-  sendTeleop(vector.vx, vector.vy, vector.omega || 0);
-  dashboardState.keyboardInterval = window.setInterval(() => {
-    sendTeleop(vector.vx, vector.vy, vector.omega || 0);
-  }, 120);
-}
-
-function stopTeleopPulse() {
-  if (dashboardState.keyboardInterval) {
-    window.clearInterval(dashboardState.keyboardInterval);
-    dashboardState.keyboardInterval = null;
-  }
-  sendTeleop(0, 0, 0);
-}
-
-function teleopPreset(name) {
-  const presets = {
-    forward: { vx: 0.45, vy: 0, omega: 0 },
-    back: { vx: -0.45, vy: 0, omega: 0 },
-    left: { vx: 0, vy: 0.22, omega: 0 },
-    right: { vx: 0, vy: -0.22, omega: 0 },
-  };
-  return presets[name] || { vx: 0, vy: 0, omega: 0 };
-}
-
-function sendTeleop(vx, vy, omega) {
-  postJson("/command", { cmd: "teleop", vx, vy, omega }).catch(() => {});
-}
-
-async function refreshWaypoints() {
-  try {
-    const response = await fetch("/waypoints");
-    const data = await response.json();
-    if (!dashboardState.snapshot) {
-      dashboardState.snapshot = { waypoints: data.data || {} };
-    } else {
-      dashboardState.snapshot.waypoints = data.data || {};
-    }
-    renderWaypoints();
-  } catch (error) {
-    console.error("Failed to load waypoints", error);
-  }
-}
-
-function renderWaypoints() {
-  const snapshot = dashboardState.snapshot;
-  const select = elements["waypoint-select"];
-  if (!snapshot || !select) {
-    return;
-  }
-  const waypoints = snapshot.waypoints || {};
-  const current = select.value;
-  select.innerHTML = Object.entries(waypoints).map(([name, coords]) =>
-    `<option value="${escapeAttribute(name)}">${escapeHtml(name)} (${formatNumber(coords[0])}, ${formatNumber(coords[1])})</option>`,
-  ).join("");
-  if (current && waypoints[current]) {
-    select.value = current;
-  }
-}
-
-async function refreshConfig() {
-  try {
-    const response = await fetch("/config");
-    const data = await response.json();
-    if (!dashboardState.snapshot) {
-      dashboardState.snapshot = { config: data.data || {}, config_meta: data.meta || {} };
-    } else {
-      dashboardState.snapshot.config = data.data || {};
-      dashboardState.snapshot.config_meta = data.meta || {};
-    }
-    dashboardState.configRenderedHash = "";
-    renderConfig();
-  } catch (error) {
-    console.error("Failed to load config", error);
-  }
-}
-
-async function saveConfig() {
-  const payload = collectConfigValues();
-  await postJson("/config", payload);
-  dashboardState.configRenderedHash = "";
-  await refreshConfig();
-}
-
-function collectConfigValues() {
-  const payload = {};
-  document.querySelectorAll("[data-config-section][data-config-key]").forEach((field) => {
-    const section = field.dataset.configSection;
-    const key = field.dataset.configKey;
-    if (!payload[section]) {
-      payload[section] = {};
-    }
-    const toggle = field.querySelector(".config-toggle");
-    if (toggle) {
-      payload[section][key] = toggle.checked;
-      return;
-    }
-    const input = field.querySelector(".config-input");
-    if (!input) {
-      return;
-    }
-    payload[section][key] = input.type === "number" ? Number(input.value) : input.value;
-  });
-  return payload;
-}
-
-async function startArmVoiceTest() {
-  elements["arm-voice-detail"].textContent = "Starting…";
-  try {
-    await postJson("/arm/voice", { action: "start", mode: "local_fake" });
-  } catch (error) {
-    setPillState(elements["arm-voice-pill"], "status-error", "Error");
-    elements["arm-voice-detail"].textContent = String(error.message || error);
-  }
-}
-
-async function stopArmVoiceTest() {
-  elements["arm-voice-detail"].textContent = "Stopping…";
-  try {
-    await postJson("/arm/voice", { action: "stop" });
-  } catch (error) {
-    elements["arm-voice-detail"].textContent = String(error.message || error);
-  }
-}
-
-async function refreshPickupDetection() {
-  elements["pickup-detail"].textContent = "Refreshing…";
-  try {
-    await postJson("/pickup", { action: "refresh" });
-  } catch (error) {
-    elements["pickup-detail"].textContent = String(error.message || error);
-  }
-}
-
-async function startPickup() {
-  elements["pickup-detail"].textContent = "Starting…";
-  try {
-    await postJson("/pickup", { action: "start" });
-  } catch (error) {
-    elements["pickup-detail"].textContent = String(error.message || error);
-  }
-}
-
-async function stopPickup() {
-  try {
-    await postJson("/pickup", { action: "stop" });
-  } catch (error) {
-    elements["pickup-detail"].textContent = String(error.message || error);
-  }
 }
 
 function initCameraStream() {
   const img = elements["camera-stream"];
-  img.src = `/camera?stream=${Date.now()}`;
+  if (!img) {
+    return;
+  }
+  img.addEventListener("error", () => {
+    scheduleCameraStreamRetry(1000);
+  });
   img.addEventListener("load", () => {
-    resizeOverlayCanvas(elements["camera-overlay"]);
-    renderCameraOverlay();
-  }, { once: false });
+    if (dashboardState.cameraRetryTimer) {
+      window.clearTimeout(dashboardState.cameraRetryTimer);
+      dashboardState.cameraRetryTimer = null;
+    }
+  });
+  restartCameraStream();
+}
+
+function restartCameraStream() {
+  const img = elements["camera-stream"];
+  if (!img) {
+    return;
+  }
+  img.src = `/camera?stream=${Date.now()}`;
+}
+
+function scheduleCameraStreamRetry(delayMs = 1000) {
+  if (dashboardState.cameraRetryTimer) {
+    window.clearTimeout(dashboardState.cameraRetryTimer);
+  }
+  dashboardState.cameraRetryTimer = window.setTimeout(() => {
+    dashboardState.cameraRetryTimer = null;
+    restartCameraStream();
+  }, delayMs);
 }
 
 function resizeCanvases() {
   resizeCanvas(elements["map-canvas"]);
-  resizeOverlayCanvas(elements["camera-overlay"]);
+  resizeCanvas(elements["lidar-canvas"]);
 }
 
 function resizeCanvas(canvas) {
@@ -1408,24 +890,102 @@ function resizeCanvas(canvas) {
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
 }
 
-function resizeOverlayCanvas(canvas) {
-  if (!canvas) {
-    return;
+async function refreshWaypoints(preferredWaypoint = "") {
+  if (preferredWaypoint) {
+    dashboardState.selectedWaypoint = String(preferredWaypoint).trim();
   }
-  const image = elements["camera-stream"];
-  const ratio = window.devicePixelRatio || 1;
-  const width = image.clientWidth || canvas.clientWidth || 320;
-  const height = image.clientHeight || 180;
-  canvas.width = Math.max(1, Math.floor(width * ratio));
-  canvas.height = Math.max(1, Math.floor(height * ratio));
-  canvas.style.width = `${width}px`;
-  canvas.style.height = `${height}px`;
-  const ctx = canvas.getContext("2d");
-  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  try {
+    const response = await fetch("/waypoints");
+    const data = await response.json();
+    if (!dashboardState.snapshot) {
+      dashboardState.snapshot = { waypoints: data.data || {} };
+    } else {
+      dashboardState.snapshot.waypoints = data.data || {};
+    }
+    renderWaypoints();
+  } catch (error) {
+    console.error("Failed to load waypoints", error);
+  }
 }
 
-function updateMapModeLabel() {
-  elements["map-mode-label"].textContent = `Click: ${dashboardState.mapMode}`;
+async function listenForTarget() {
+  elements["object-target-detail"].textContent = "Listening for target object...";
+  try {
+    await postJson("/target-object", { action: "listen" });
+  } catch (error) {
+    elements["object-target-detail"].textContent = String(error.message || error);
+  }
+}
+
+async function setTargetLabel() {
+  const current = (((dashboardState.snapshot || {}).object_target || {}).label || "").trim();
+  const label = window.prompt("Object to detect?", current || "chair");
+  if (!label || !label.trim()) {
+    return;
+  }
+  try {
+    await postJson("/target-object", { action: "set", label: label.trim() });
+  } catch (error) {
+    elements["object-target-detail"].textContent = String(error.message || error);
+  }
+}
+
+async function clearTargetLabel() {
+  try {
+    await postJson("/target-object", { action: "clear" });
+  } catch (error) {
+    elements["object-target-detail"].textContent = String(error.message || error);
+  }
+}
+
+function setMapMode(mode) {
+  dashboardState.mapMode = mode === "waypoint" ? "waypoint" : "goal";
+  renderMapModeControls();
+}
+
+async function startArmVoiceTest() {
+  elements["arm-voice-detail"].textContent = "Starting...";
+  try {
+    await postJson("/arm/voice", { action: "start", mode: "local_fake" });
+  } catch (error) {
+    elements["arm-voice-detail"].textContent = String(error.message || error);
+  }
+}
+
+async function stopArmVoiceTest() {
+  elements["arm-voice-detail"].textContent = "Stopping...";
+  try {
+    await postJson("/arm/voice", { action: "stop" });
+  } catch (error) {
+    elements["arm-voice-detail"].textContent = String(error.message || error);
+  }
+}
+
+async function refreshPickupDetection() {
+  elements["pickup-detail"].textContent = "Refreshing...";
+  try {
+    await postJson("/pickup", { action: "refresh" });
+  } catch (error) {
+    elements["pickup-detail"].textContent = String(error.message || error);
+  }
+}
+
+async function startPickup() {
+  elements["pickup-detail"].textContent = "Starting...";
+  try {
+    await postJson("/pickup", { action: "start" });
+  } catch (error) {
+    elements["pickup-detail"].textContent = String(error.message || error);
+  }
+}
+
+async function stopPickup() {
+  elements["pickup-detail"].textContent = "Stopping...";
+  try {
+    await postJson("/pickup", { action: "stop" });
+  } catch (error) {
+    elements["pickup-detail"].textContent = String(error.message || error);
+  }
 }
 
 async function postJson(url, payload) {
@@ -1482,6 +1042,16 @@ function robotToWorld(x, y, pose) {
   };
 }
 
+function worldToRobot(x, y, pose) {
+  const theta = Number(pose.theta || 0);
+  const dx = Number(x || 0) - Number(pose.x || 0);
+  const dy = Number(y || 0) - Number(pose.y || 0);
+  return {
+    x: Math.cos(theta) * dx + Math.sin(theta) * dy,
+    y: -Math.sin(theta) * dx + Math.cos(theta) * dy,
+  };
+}
+
 function setPillState(element, className, label) {
   if (!element) {
     return;
@@ -1507,8 +1077,9 @@ function statusClassFor(status) {
 
 function humanizeStatus(status) {
   const normalized = String(status || "disconnected").toLowerCase();
-  const map = {
+  const labels = {
     connected: "OK",
+    disconnected: "Idle",
     running: "Run",
     starting: "Start",
     stopping: "Stop",
@@ -1517,19 +1088,14 @@ function humanizeStatus(status) {
     ready: "Ready",
     success: "OK",
     searching: "Scan",
-    stopped: "Off",
     warning: "Warn",
     warn: "Warn",
   };
-  return map[normalized] || "—";
+  return labels[normalized] || "Idle";
 }
 
 function formatNumber(value, digits = 2) {
   return Number(value || 0).toFixed(digits);
-}
-
-function capitalize(value) {
-  return value ? value.charAt(0).toUpperCase() + value.slice(1) : "";
 }
 
 function clamp(value, min, max) {

@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 SNAPSHOT_RATE_HZ = 10.0
 MAX_LOG_ENTRIES = 250
 MAX_MAP_DIMENSION = 120
+IMU_STARTUP_TIMEOUT_S = 20.0
 
 DEFAULT_SUBSYSTEMS = {
     "LiDAR": {"icon": "LD", "status": "disconnected", "detail": "Waiting for scan data"},
@@ -118,6 +119,7 @@ class WebUI:
         self._clients: set[Any] = set()
         self._command_queue: List[Dict[str, Any]] = []
         self._landmark_queue: List[Dict[str, Any]] = []
+        self._target_queue: List[Dict[str, Any]] = []
         self._runner = None
         self._site = None
         self._app = None
@@ -155,6 +157,7 @@ class WebUI:
         self._app.router.add_get("/waypoints", self._handle_get_waypoints)
         self._app.router.add_post("/waypoints", self._handle_post_waypoints)
         self._app.router.add_post("/command", self._handle_post_command)
+        self._app.router.add_post("/target-object", self._handle_post_target_object)
         self._app.router.add_post("/pickup", self._handle_post_pickup)
         self._app.router.add_post("/arm/voice", self._handle_post_arm_voice)
         self._app.router.add_post("/landmark", self._handle_post_landmark)
@@ -227,10 +230,35 @@ class WebUI:
         """Poll HyperIMU UDP samples and push into dashboard state."""
 
         async def _loop() -> None:
+            wait_started = time.monotonic()
+            timeout_logged = False
             while self._started:
                 data = imu.get_latest()
                 if data is not None:
                     self.set_imu_state(data)
+                    timeout_logged = False
+                else:
+                    waited_s = time.monotonic() - wait_started
+                    if waited_s >= IMU_STARTUP_TIMEOUT_S:
+                        self.set_subsystem_status(
+                            "IMU",
+                            "warning",
+                            f"Timed out after {IMU_STARTUP_TIMEOUT_S:.0f}s waiting for HyperIMU packets",
+                        )
+                        if not timeout_logged:
+                            self.append_log(
+                                f"No HyperIMU packets received after {IMU_STARTUP_TIMEOUT_S:.0f}s",
+                                level="WARN",
+                                source="imu",
+                            )
+                            timeout_logged = True
+                    else:
+                        remaining_s = max(0.0, IMU_STARTUP_TIMEOUT_S - waited_s)
+                        self.set_subsystem_status(
+                            "IMU",
+                            "warning",
+                            f"Waiting for HyperIMU packets ({remaining_s:.0f}s left)",
+                        )
                 await asyncio.sleep(interval_s)
 
         self._imu_poll_task = asyncio.create_task(_loop(), name="web-ui-imu-poll")
@@ -335,6 +363,16 @@ class WebUI:
                 "source": kwargs.get("source", "api"),
             }
         self._set_state_key("goal", payload)
+
+    def set_object_target(self, object_target: Optional[Dict[str, Any]] = None, **kwargs: Any) -> None:
+        with self._lock:
+            current = copy.deepcopy(self._state["object_target"])
+            if isinstance(object_target, dict):
+                current.update(object_target)
+            current.update(kwargs)
+            current["updated_at"] = self._iso_now()
+            self._state["object_target"] = current
+            self._state["meta"]["updated_at"] = self._iso_now()
 
     def set_nav_state(self, nav_state: Optional[Dict[str, Any]] = None, **kwargs: Any) -> None:
         updates = dict(nav_state or {})
@@ -636,6 +674,18 @@ class WebUI:
             encoding="utf-8",
         )
 
+    def upsert_waypoint(self, name: str, x: float, y: float) -> Dict[str, List[float]]:
+        waypoint_name = str(name).strip()
+        if not waypoint_name:
+            raise ValueError("Waypoint name required")
+        with self._lock:
+            current = copy.deepcopy(self._state["waypoints"])
+        current[waypoint_name] = [float(x), float(y)]
+        self._set_state_key("waypoints", current)
+        self.save_waypoints(current)
+        self.append_log(f"Waypoint saved: {waypoint_name}", level="INFO", source="api")
+        return current
+
     def consume_commands(self) -> List[Dict[str, Any]]:
         with self._lock:
             items = list(self._command_queue)
@@ -648,6 +698,13 @@ class WebUI:
             items = list(self._landmark_queue)
             self._landmark_queue.clear()
             self._refresh_queue_meta_locked()
+            return items
+
+    def consume_target_requests(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            items = list(self._target_queue)
+            self._target_queue.clear()
+            self._state["meta"]["updated_at"] = self._iso_now()
             return items
 
     def get_snapshot(self) -> Dict[str, Any]:
@@ -731,6 +788,46 @@ class WebUI:
             self._state["meta"]["updated_at"] = self._iso_now()
         self.append_log(f"Command queued for controller: {cmd}", level="INFO", source="api")
         return web.json_response({"type": "command_ack", "data": command})
+
+    async def _handle_post_target_object(self, request: Any) -> Any:
+        payload = await request.json()
+        action = str(payload.get("action", "")).lower()
+        request_item = {"action": action, "ts": self._iso_now()}
+
+        if action == "listen":
+            self.set_object_target(
+                status="listening",
+                listening=True,
+                detail="Listening for target object...",
+            )
+        elif action == "set":
+            label = str(payload.get("label", "")).strip()
+            if not label:
+                return web.json_response({"error": "Target label required"}, status=400)
+            request_item["label"] = label
+            self.set_object_target(
+                label=label,
+                status="set",
+                listening=False,
+                detail=f"Tracking target label '{label}'",
+            )
+        elif action == "clear":
+            self.set_object_target(
+                label="",
+                status="idle",
+                listening=False,
+                detail="No target object selected.",
+                detection=None,
+                transcript="",
+            )
+        else:
+            return web.json_response({"error": "Unsupported target action"}, status=400)
+
+        with self._lock:
+            self._target_queue.append(request_item)
+            self._state["meta"]["updated_at"] = self._iso_now()
+        self.append_log(f"Target request queued: {action}", level="INFO", source="api")
+        return web.json_response({"type": "target_ack", "data": request_item})
 
     async def _handle_post_pickup(self, request: Any) -> Any:
         payload = await request.json()
@@ -1038,6 +1135,18 @@ class WebUI:
                 "grid_size": 0,
                 "origin_cell": 0,
                 "shape": [0, 0],
+            },
+            "object_target": {
+                "label": "",
+                "status": "idle",
+                "listening": False,
+                "detail": "No target object selected.",
+                "transcript": "",
+                "detection": None,
+                "lidar_target": None,
+                "waypoint_name": "",
+                "waypoint_point": None,
+                "updated_at": None,
             },
             "voice": {"transcript": "", "response": "", "updated_at": None},
             "arm_voice": {

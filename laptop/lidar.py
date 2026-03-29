@@ -68,6 +68,8 @@ _CRC_TABLE = [
     0x19, 0x54, 0x83, 0xCE, 0x60, 0x2D, 0xFA, 0xB7,
     0x5D, 0x10, 0xC7, 0x8A, 0x24, 0x69, 0xBE, 0xF3,
     0xAF, 0xE2, 0x35, 0x78, 0xD6, 0x9B, 0x4C, 0x01,
+    0xF4, 0xB9, 0x6E, 0x23, 0x8D, 0xC0, 0x17, 0x5A,
+    0x06, 0x4B, 0x9C, 0xD1, 0x7F, 0x32, 0xE5, 0xA8,
 ]
 
 
@@ -88,18 +90,33 @@ class LidarScan:
     points: List[Tuple[float, float, int]] = field(default_factory=list)
     timestamp: float = 0.0
 
-    def as_numpy(self, min_range: float = 0.0, max_range: float = 100.0) -> np.ndarray:
-        """Return Nx3 array (angle_deg, distance_m, intensity), range-filtered."""
+    def as_numpy(self, min_range: float = 0.0, max_range: float = 100.0,
+                 fov_deg: float = 360.0, fov_center_deg: float = 0.0) -> np.ndarray:
+        """Return Nx3 array (angle_deg, distance_m, intensity), range- and FOV-filtered.
+
+        fov_deg: angular width of the field of view to keep.
+        fov_center_deg: center of the FOV (0 = forward, i.e. 0°).
+        Points outside the FOV arc are discarded — use this to mask out
+        the wheelchair body when the LiDAR is front-mounted.
+        """
         if not self.points:
             return np.empty((0, 3), dtype=np.float32)
         arr = np.array(self.points, dtype=np.float32)
         mask = (arr[:, 1] >= min_range) & (arr[:, 1] <= max_range)
+
+        if fov_deg < 360.0:
+            # Normalize angles to [-180, 180] relative to FOV center
+            half_fov = fov_deg / 2.0
+            rel_angle = (arr[:, 0] - fov_center_deg + 180.0) % 360.0 - 180.0
+            mask = mask & (np.abs(rel_angle) <= half_fov)
+
         return arr[mask]
 
     def as_xy(self, min_range: float = 0.0, max_range: float = 100.0,
-              angle_offset_deg: float = 0.0) -> np.ndarray:
+              angle_offset_deg: float = 0.0,
+              fov_deg: float = 360.0, fov_center_deg: float = 0.0) -> np.ndarray:
         """Return Nx2 array of (x, y) in meters, robot-local frame."""
-        arr = self.as_numpy(min_range, max_range)
+        arr = self.as_numpy(min_range, max_range, fov_deg, fov_center_deg)
         if arr.shape[0] == 0:
             return np.empty((0, 2), dtype=np.float32)
         angles_rad = np.deg2rad(arr[:, 0] + angle_offset_deg)
@@ -238,6 +255,8 @@ class STL19Lidar:
             min_range=cfg.min_range_m,
             max_range=cfg.max_range_m,
             angle_offset_deg=self._angle_offset,
+            fov_deg=cfg.fov_deg,
+            fov_center_deg=cfg.fov_center_deg,
         )
 
     async def stop(self) -> None:
@@ -298,6 +317,7 @@ class FakeLidar:
         cfg = load_config().lidar
         return self._latest_scan.as_xy(
             min_range=cfg.min_range_m, max_range=cfg.max_range_m,
+            fov_deg=cfg.fov_deg, fov_center_deg=cfg.fov_center_deg,
         )
 
     async def stop(self) -> None:

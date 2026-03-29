@@ -17,7 +17,9 @@
  *            "f"            — turn CCW
  *            "1"-"4"        — spin wheel CW  (FL, FR, RL, RR)
  *            "5"-"8"        — spin wheel CCW (FL, FR, RL, RR)
- *   Note: single-char movement commands run until watchdog cuts them (~500ms)
+ *   Note: single-char movement commands are momentary and only keep moving
+ *   while commands continue arriving. The watchdog cuts motion quickly
+ *   (~250ms), so repeat-while-held senders behave like hold-to-move teleop.
  *   Send:    {"estop": 0|1, "enc": [dFL, dFR, dRL, dRR]}
  *            enc = delta ticks since last report (signed int32)
  *
@@ -81,9 +83,10 @@ const int MOTOR_SIGN[4] = { -1,  +1,  -1,  +1 };
 //                            FL   FR   RL   RR
 const int ENC_SIGN[4]   = { +1,  +1,  +1,  +1 };
 
-#define PWM_MAX             100   // ~40% duty cycle. Raise toward 255 if motors still stall.
+#define PWM_MAX             180   // Higher demo power for stronger motion/rotation authority.
+#define ROTATION_OMEGA_FULL 0.5f  // Pure in-place turns reach full PWM by omega=0.5.
 #define SERIAL_BAUD         115200
-#define WATCHDOG_TIMEOUT_MS 1000
+#define WATCHDOG_TIMEOUT_MS 250   // Hold-to-run: commands must be refreshed continuously.
 #define LOOP_PERIOD_MS       50   // ~20 Hz
 #define SERIAL_BUF_SIZE     128
 
@@ -189,7 +192,16 @@ void computeMecanumIK(float vx, float vy, float omega) {
   }
 
   if (maxVal > 1e-6f) {
-    float scale = (maxVal > 1.0f) ? (float)PWM_MAX / maxVal : (float)PWM_MAX;
+    // Give pure in-place rotation more authority so scan/search turns can
+    // overcome static friction without forcing all combined motions to full PWM.
+    bool pureRotation = (fabs(vx) < 1e-3f) && (fabs(vy) < 1e-3f) && (fabs(omega) > 1e-3f);
+    float scale;
+    if (pureRotation) {
+      float omegaScale = max(fabs(omega), ROTATION_OMEGA_FULL);
+      scale = (float)PWM_MAX / omegaScale;
+    } else {
+      scale = (maxVal > 1.0f) ? (float)PWM_MAX / maxVal : (float)PWM_MAX;
+    }
     for (uint8_t i = 0; i < 4; i++) motorCommand[i] = (int)(raw[i] * scale);
   } else {
     for (uint8_t i = 0; i < 4; i++) motorCommand[i] = 0;

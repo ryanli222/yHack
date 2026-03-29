@@ -1,12 +1,13 @@
 """
-Camera perception: ORB feature extraction, landmark detection, and
+Camera perception: YOLOv8 object detection, ORB landmark matching, and
 mono-depth obstacle estimation.
 
-Stereo calibration is cooked so we use mono heuristics: objects lower in
-the frame are closer. Combined with LiDAR this is good enough for the demo.
+YOLOv8 detects 80 COCO object classes (person, chair, bottle, etc.).
+ORB matches previously-seen landmarks for relocalization.
+Mono heuristics estimate depth — objects lower in frame are closer.
 
 Provides:
-  - Perception: real OpenCV camera pipeline
+  - Perception: real OpenCV camera pipeline (YOLO + ORB)
   - FakePerception: synthetic obstacles for testing
   - create_perception(): factory
 """
@@ -24,6 +25,12 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from config import CameraConfig, load_config
+
+try:
+    from yolo_vision import YoloDetection, YoloV8OpenCvDetector
+except ImportError:
+    YoloDetection = None
+    YoloV8OpenCvDetector = None
 
 logger = logging.getLogger(__name__)
 
@@ -74,16 +81,29 @@ class Perception:
         self._obstacles: List[Obstacle] = []
         self._landmarks: List[Landmark] = []
         self._known_landmarks: List[Tuple[str, np.ndarray]] = []  # (name, descriptor)
+        self._yolo_detections: list = []
 
         self._running = False
         self._lock = threading.Lock()
+        self._yolo: Optional[YoloV8OpenCvDetector] = None
 
     async def start(self) -> None:
         import cv2
         self._cap = cv2.VideoCapture(self._cam_idx)
-        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
-        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
+
+        # Only set resolution if the camera doesn't already match.
+        # NVIDIA Broadcast and other virtual cameras can produce black
+        # letterbox bars when forced to a non-native resolution.
+        native_w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        native_h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if native_w != self._width or native_h != self._height:
+            self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
+            self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
         self._cap.set(cv2.CAP_PROP_FPS, self._fps)
+
+        # Read actual resolution after any driver negotiation
+        self._width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self._height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         if not self._cap.isOpened():
             logger.error("Failed to open camera %d", self._cam_idx)
@@ -91,6 +111,15 @@ class Perception:
 
         self._orb = cv2.ORB_create(nfeatures=self._orb_features)
         self._bf_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+        # YOLO object detector (80 COCO classes)
+        if YoloV8OpenCvDetector is not None:
+            try:
+                self._yolo = YoloV8OpenCvDetector()
+                logger.info("YOLOv8 detector loaded")
+            except Exception as exc:
+                logger.warning("YOLOv8 init failed, running without: %s", exc)
+
         self._running = True
         logger.info("Perception started (camera %d, %dx%d @ %d fps)",
                      self._cam_idx, self._width, self._height, self._fps)
@@ -109,12 +138,77 @@ class Perception:
             obstacles = self._detect_obstacles(gray)
             landmarks = self._detect_landmarks(gray)
 
+            # YOLO detection on colour frame
+            yolo_dets = []
+            if self._yolo is not None:
+                try:
+                    yolo_dets = self._yolo.detect(frame)
+                except Exception as exc:
+                    logger.debug("YOLO detect error: %s", exc)
+
             with self._lock:
                 self._latest_frame = frame
                 self._obstacles = obstacles
                 self._landmarks = landmarks
+                self._yolo_detections = yolo_dets
 
             await asyncio.sleep(1.0 / self._fps)
+
+    # Safety margin (pixels) to trim inward from detected content edges.
+    # Eliminates Canny artefacts at the black-bar / content boundary.
+    _LETTERBOX_MARGIN = 20
+
+    @staticmethod
+    def _find_content_bounds(gray: np.ndarray) -> Tuple[int, int, int, int]:
+        """Return (x_start, x_end, y_start, y_end) of actual camera content.
+
+        NVIDIA Broadcast pads the frame with solid-black letterbox bars.
+        We detect them by looking for contiguous runs of columns/rows from
+        each edge where the *maximum* pixel value is very low (< 10).
+        Using per-column max instead of mean avoids false positives when
+        real content happens to be dark on average.
+
+        After finding the content box we add ``_LETTERBOX_MARGIN`` pixels
+        of inward padding so any residual brightness gradient at the
+        boundary is excluded from downstream edge detection.
+
+        When no bars are detected the full frame dimensions are returned
+        (minus the safety margin).
+        """
+        h, w = gray.shape
+        margin = Perception._LETTERBOX_MARGIN
+
+        col_max = gray.max(axis=0)   # shape (w,)
+        row_max = gray.max(axis=1)   # shape (h,)
+
+        # Scan from the left/right to find first non-black column
+        x_start = 0
+        while x_start < w and col_max[x_start] < 10:
+            x_start += 1
+        x_end = w - 1
+        while x_end > x_start and col_max[x_end] < 10:
+            x_end -= 1
+
+        # Same for top/bottom rows
+        y_start = 0
+        while y_start < h and row_max[y_start] < 10:
+            y_start += 1
+        y_end = h - 1
+        while y_end > y_start and row_max[y_end] < 10:
+            y_end -= 1
+
+        # If bars were detected, add an extra inward margin to eliminate
+        # the brightness ramp at the transition edge.
+        if x_start > 0:
+            x_start = min(x_start + margin, x_end)
+        if x_end < w - 1:
+            x_end = max(x_end - margin, x_start)
+        if y_start > 0:
+            y_start = min(y_start + margin, y_end)
+        if y_end < h - 1:
+            y_end = max(y_end - margin, y_start)
+
+        return x_start, x_end, y_start, y_end
 
     def _detect_obstacles(self, gray: np.ndarray) -> List[Obstacle]:
         """Edge-based mono obstacle detection with depth-from-vertical heuristic.
@@ -122,15 +216,47 @@ class Perception:
         Objects lower in the frame are closer. We find strong edges in the
         bottom 2/3 of the image, cluster them, and estimate distance from
         their vertical position.
+
+        Black letterbox bars (NVIDIA Broadcast) are removed before edge
+        detection so their sharp brightness transitions are never reported
+        as obstacles.
         """
         import cv2
         h, w = gray.shape
 
-        # Canny edge detection
-        edges = cv2.Canny(gray, 50, 150)
+        # --- letterbox removal -----------------------------------------
+        x_start, x_end, y_start, y_end = self._find_content_bounds(gray)
+
+        content_w = x_end - x_start + 1
+        content_h = y_end - y_start + 1
+        if content_w < 50 or content_h < 50:
+            return []  # frame is mostly black, skip
+
+        # Crop to verified content region
+        cropped = gray[y_start:y_end + 1, x_start:x_end + 1]
+
+        # Zero-out a thin border inside the crop to kill any residual
+        # brightness ramp that survived the margin.  GaussianBlur also
+        # softens any remaining hard transitions so Canny ignores them.
+        border = 8
+        cropped[:border, :] = 0
+        cropped[-border:, :] = 0
+        cropped[:, :border] = 0
+        cropped[:, -border:] = 0
+        cropped = cv2.GaussianBlur(cropped, (5, 5), 0)
+
+        # Canny edge detection on content region
+        edges = cv2.Canny(cropped, 50, 150)
+
+        # Ensure nothing leaks from the zeroed border
+        edges[:border, :] = 0
+        edges[-border:, :] = 0
+        edges[:, :border] = 0
+        edges[:, -border:] = 0
 
         # Only look at bottom 2/3 (foreground)
-        roi = edges[h // 3:, :]
+        ch, cw = cropped.shape
+        roi = edges[ch // 3:, :]
         roi_h = roi.shape[0]
 
         # Find contours
@@ -152,8 +278,8 @@ class Perception:
             frac = 1.0 - (cy / max(roi_h, 1))
             depth = 0.5 + frac * 2.5
 
-            # Horizontal angle: center of image = 0, edges = +/- 30 deg (approx FOV/2)
-            angle = (cx / w - 0.5) * math.radians(60)
+            # Horizontal angle: center of cropped content = 0, edges = +/- 30 deg (approx FOV/2)
+            angle = (cx / max(cw, 1) - 0.5) * math.radians(60)
 
             obs_x = depth * math.cos(angle)
             obs_y = depth * math.sin(angle)
@@ -243,6 +369,10 @@ class Perception:
         with self._lock:
             return list(self._landmarks)
 
+    def get_yolo_detections(self) -> list:
+        with self._lock:
+            return list(self._yolo_detections)
+
     def get_frame(self) -> Optional[np.ndarray]:
         with self._lock:
             return self._latest_frame
@@ -308,6 +438,9 @@ class FakePerception:
 
     def register_landmark(self, name: str, descriptor: np.ndarray) -> None:
         pass
+
+    def get_yolo_detections(self) -> list:
+        return []
 
     def capture_landmark_descriptor(self, name: str) -> Optional[np.ndarray]:
         return None

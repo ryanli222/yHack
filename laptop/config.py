@@ -103,6 +103,8 @@ class LidarConfig:
     min_range_m: float = 0.02
     max_range_m: float = 12.0
     angle_offset_deg: float = 0.0     # rotate scan to match robot frame
+    fov_deg: float = 120.0            # field of view to keep (front-mounted)
+    fov_center_deg: float = 0.0       # center of FOV (0 = forward)
 
 
 @dataclass

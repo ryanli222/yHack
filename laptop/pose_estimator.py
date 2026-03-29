@@ -112,6 +112,9 @@ class PoseEstimator:
         self._x[2] += dtheta
         self._x[2] = self._normalize_angle(self._x[2])
 
+        # Track omega for IMU cross-check
+        self._last_omega_val = omega
+
         # Jacobian of motion model w.r.t. state
         F = np.eye(3)
         F[0, 2] = (-sin_t * vx - cos_t * vy) * dt
@@ -127,49 +130,45 @@ class PoseEstimator:
     def update_imu(self, gyro_z: float, dt: float) -> None:
         """Update theta using phone IMU yaw rate measurement.
 
+        The gyro provides an independent heading rate. We integrate it and
+        compare against the encoder-predicted heading to produce a standard
+        EKF correction on theta.
+
         Args:
             gyro_z: measured yaw rate in rad/s
             dt: time step in seconds
         """
-        # Predicted theta_dot from the motion model is already baked into predict().
-        # Here we correct theta using the gyro-integrated heading change.
-        # Measurement: z = integrated gyro = gyro_z * dt
-        # Expected: h(x) = dtheta from predict step... but simpler:
-        #   We treat gyro_z * dt as a direct measurement of delta-theta.
-        #   Compare against the predict step's delta-theta.
-        # Simplification: just correct absolute theta rate discrepancy.
+        if dt <= 0:
+            return
 
-        # Measurement model: z = theta_dot (from gyro), h(x) = omega (from encoders)
-        # But since we've already integrated in predict(), do a heading correction:
+        # The predict step already applied encoder-based omega*dt to theta.
+        # The gyro says the *true* heading change was gyro_z * dt.
+        # So the gyro-implied absolute theta is:
+        #   theta_gyro = theta_before_predict + gyro_z * dt
+        # Which equals:
+        #   theta_current - encoder_dtheta + gyro_dtheta
+        #   = self._x[2] - _last_omega * dt + gyro_z * dt
+        encoder_omega = self._get_last_omega()
+        theta_measured = self._x[2] + (gyro_z - encoder_omega) * dt
 
-        # H matrix: we observe theta directly via gyro integration
-        H = np.array([[0, 0, 1]])  # observing theta
+        # Observation: theta (H = [0, 0, 1])
+        H = np.array([[0, 0, 1]])
 
-        # Measurement noise
         r_gyro = self._ekf_cfg.imu_gyro_noise ** 2
         R = np.array([[r_gyro]])
 
-        # Innovation: compare gyro-integrated heading change with predicted
-        theta_measured = self._x[2] + gyro_z * dt - self._get_last_omega() * dt
-        # Simplify: just use gyro to reduce theta uncertainty
-        z = np.array([gyro_z * dt])
-        h = np.array([0.0])  # expected delta from gyro alone = 0 correction
+        z = np.array([theta_measured])
+        h = np.array([self._x[2]])
 
-        # Actually, cleanest approach: gyro gives absolute heading rate.
-        # We already applied encoder-based heading. Gyro cross-checks it.
-        # Use as a proportional correction on theta.
+        innovation = z - h
+        innovation[0] = self._normalize_angle(innovation[0])
 
         S = H @ self._P @ H.T + R
-        K = self._P @ H.T @ np.linalg.inv(S)
+        K = self._P @ H.T @ np.linalg.solve(S, np.eye(S.shape[0]))
 
-        # Innovation: how much gyro disagrees with current theta rate
-        # Small correction — don't fight the encoders too hard
-        innovation = np.array([gyro_z * dt * 0.1])  # blend factor
-        # Actually: skip complex innovation, just shrink theta covariance
-        # when gyro is active. The main value is bounding drift.
-
-        # Reduce theta uncertainty when gyro is reading
-        self._P[2, 2] = min(self._P[2, 2], r_gyro * 10)
+        self._x = self._x + (K @ innovation).flatten()
+        self._x[2] = self._normalize_angle(self._x[2])
+        self._P = (np.eye(3) - K @ H) @ self._P
 
     # ------------------------------------------------------------------
     # EKF update: LiDAR scan match (optional, called from slam.py)
@@ -194,7 +193,7 @@ class PoseEstimator:
         innovation[2] = self._normalize_angle(innovation[2])
 
         S = H @ self._P @ H.T + R
-        K = self._P @ H.T @ np.linalg.inv(S)
+        K = self._P @ H.T @ np.linalg.solve(S, np.eye(S.shape[0]))
 
         self._x = self._x + K @ innovation
         self._x[2] = self._normalize_angle(self._x[2])
@@ -226,8 +225,4 @@ class PoseEstimator:
 
     @staticmethod
     def _normalize_angle(a: float) -> float:
-        while a > math.pi:
-            a -= 2.0 * math.pi
-        while a < -math.pi:
-            a += 2.0 * math.pi
-        return a
+        return math.atan2(math.sin(a), math.cos(a))
