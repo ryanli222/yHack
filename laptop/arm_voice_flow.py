@@ -118,7 +118,7 @@ def _tool_lateral_delta(current_pose: ArmPose | Mapping[str, Any], distance_mm: 
     reference_up = [0.0, 0.0, 1.0]
     if abs(_dot(forward, reference_up)) >= 0.999:
         reference_up = [1.0, 0.0, 0.0]
-    left = _normalize_vector(_cross(reference_up, forward))
+    left = _normalize_vector(_cross(forward, reference_up))
     left = _normalize_vector(_rotate_about_axis(left, forward, float(pose_value.theta)))
     scale = float(distance_mm)
     return {
@@ -203,6 +203,36 @@ class RegexArmParser:
 
         if re.search(r"\b(home|reset|park)\b", text_lower) and re.search(r"\barm\b", text_lower):
             return {"cmd": "home"}, "Moving the arm home."
+
+        # Gripper rotation (wrist roll) — checked before general rotate
+        gripper_rotate = re.search(
+            r"(?:turn|rotate|spin)\s+(?:the\s+)?(?:gripper|claw|hand)\s+(left|right)\s+(?:by\s+)?(\d+(?:\.\d+)?)\s*(?:deg|degrees?)?\b",
+            text_lower,
+        )
+        if not gripper_rotate:
+            gripper_rotate = re.search(
+                r"(?:turn|rotate|spin)\s+(?:the\s+)?(?:gripper|claw|hand)\s+(?:by\s+)?(\d+(?:\.\d+)?)\s*(?:deg|degrees?)?\s+(left|right)\b",
+                text_lower,
+            )
+            if gripper_rotate:
+                gr_amount, gr_direction = gripper_rotate.group(1), gripper_rotate.group(2)
+            else:
+                gr_amount, gr_direction = "", ""
+        else:
+            gr_direction, gr_amount = gripper_rotate.group(1), gripper_rotate.group(2)
+        if gripper_rotate:
+            gr_delta = abs(float(gr_amount))
+            if gr_direction == "right":
+                gr_delta *= -1.0
+            return (
+                {
+                    "cmd": "move_joint_relative",
+                    "direction": gr_direction,
+                    "joint_index": 4,
+                    "delta_degrees": gr_delta,
+                },
+                f"Rotating gripper {gr_direction} {abs(gr_delta):.1f} degrees.",
+            )
 
         match = re.search(
             rf"(?:turn|rotate)\s+{_OPTIONAL_TOOL_PATTERN}{_ROTATION_DIRECTION_PATTERN}\s+(?:by\s+)?{_NUMBER_PATTERN}\s*(?:{_DEGREE_UNIT_PATTERN})?\b",

@@ -27,11 +27,24 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+try:
+    import msvcrt  # Windows non-blocking key check
+
+    def _kbhit_q() -> bool:
+        """Return True if 'q' was pressed (non-blocking, Windows)."""
+        if msvcrt.kbhit():
+            key = msvcrt.getch().decode("utf-8", errors="ignore").lower()
+            return key == "q"
+        return False
+except ImportError:
+    def _kbhit_q() -> bool:
+        """Non-Windows stub — no non-blocking key check available."""
+        return False
+
 # Ensure laptop/ is importable when run as a script.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from arm_control import ArmControlError, ArmPose, create_arm_control
-from arm_kinematics import ArmKinematicsCalibration, calibrated_joint_targets_for_pose
 from arm_voice_flow import (
     create_arm_parser,
     dispatch_arm_command,
@@ -115,6 +128,18 @@ class SafetyAbortError(RuntimeError):
     """Raised when an operator safety checkpoint is not confirmed in time."""
 
 
+async def _pause_with_estop(duration_s: float) -> bool:
+    """Sleep for *duration_s*, polling for 'q' keypress. Returns True if e-stop triggered."""
+    elapsed = 0.0
+    step = 0.05
+    while elapsed < duration_s:
+        if _kbhit_q():
+            return True
+        await asyncio.sleep(step)
+        elapsed += step
+    return False
+
+
 def _approval_from_text(text: str) -> bool:
     tokens = set(re.findall(r"[a-z]+", text.lower()))
     if tokens & {"stop", "halt", "abort", "cancel", "no", "shutdown", "quit"}:
@@ -176,133 +201,6 @@ def _clamp(value: float, lower: float, upper: float) -> float:
 
 def _wrap_degrees(value: float) -> float:
     return ((float(value) + 180.0) % 360.0) - 180.0
-
-
-def _looks_like_cartesian_ik_failure(exc: BaseException) -> bool:
-    text = str(exc).lower()
-    return (
-        "zero ik solutions" in text
-        or "physically unreachable" in text
-        or ("ik" in text and "unreachable" in text)
-    )
-
-
-def _approximate_joint_fallback_target(
-    current_pose: ArmPose,
-    target_pose: ArmPose,
-    current_joints: list[float],
-) -> tuple[list[float], dict[str, float]] | None:
-    if len(current_joints) < 3:
-        return None
-
-    current_radius = math.hypot(float(current_pose.x), float(current_pose.y))
-    target_radius = math.hypot(float(target_pose.x), float(target_pose.y))
-    current_yaw = math.degrees(math.atan2(float(current_pose.y), float(current_pose.x))) if current_radius > 1e-6 else 0.0
-    target_yaw = (
-        math.degrees(math.atan2(float(target_pose.y), float(target_pose.x)))
-        if target_radius > 1e-6
-        else current_yaw
-    )
-    yaw_delta = _wrap_degrees(target_yaw - current_yaw)
-    radial_delta = float(target_radius - current_radius)
-    vertical_delta = float(target_pose.z) - float(current_pose.z)
-
-    reach_scale = _clamp(current_radius / 220.0 if current_radius > 1e-6 else 1.0, 0.75, 1.5)
-    base_delta = _clamp(yaw_delta, -25.0, 25.0)
-    shoulder_delta = _clamp(reach_scale * ((0.18 * vertical_delta) - (0.08 * radial_delta)), -12.0, 12.0)
-    elbow_delta = _clamp(reach_scale * ((0.10 * radial_delta) - (0.10 * vertical_delta)), -12.0, 12.0)
-    wrist_delta = 0.0
-    if len(current_joints) >= 4:
-        wrist_delta = _clamp(-(shoulder_delta + elbow_delta), -15.0, 15.0)
-
-    if abs(base_delta) < 0.25:
-        base_delta = 0.0
-    if abs(shoulder_delta) < 0.25:
-        shoulder_delta = 0.0
-    if abs(elbow_delta) < 0.25:
-        elbow_delta = 0.0
-    if abs(wrist_delta) < 0.25:
-        wrist_delta = 0.0
-
-    if max(abs(base_delta), abs(shoulder_delta), abs(elbow_delta), abs(wrist_delta)) < 1e-6:
-        return None
-
-    target_joints = list(current_joints)
-    target_joints[0] = float(target_joints[0]) + base_delta
-    target_joints[1] = float(target_joints[1]) + shoulder_delta
-    target_joints[2] = float(target_joints[2]) + elbow_delta
-    if len(target_joints) >= 4:
-        target_joints[3] = float(target_joints[3]) + wrist_delta
-
-    return target_joints, {
-        "base_delta_degrees": base_delta,
-        "shoulder_delta_degrees": shoulder_delta,
-        "elbow_delta_degrees": elbow_delta,
-        "wrist_delta_degrees": wrist_delta,
-        "current_radius_mm": current_radius,
-        "target_radius_mm": target_radius,
-        "current_yaw_degrees": current_yaw,
-        "target_yaw_degrees": target_yaw,
-    }
-
-
-async def _build_joint_fallback_for_relative(
-    arm: Any,
-    command: Mapping[str, Any],
-    *,
-    target_pose: ArmPose,
-    max_joint_step: float,
-) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
-    state = await arm.get_state()
-    current_joints = list(state.joint_positions)
-    current_pose = ArmPose.from_value(state.pose)
-    calibration = ArmKinematicsCalibration.from_config()
-
-    if calibration.enabled:
-        try:
-            target_joints, fallback_details = calibrated_joint_targets_for_pose(
-                target_pose,
-                current_pose,
-                current_joints,
-                calibration=calibration,
-            )
-        except ArmControlError:
-            logger.debug("Calibrated IK fallback could not solve target pose", exc_info=True)
-        else:
-            segments = _build_joint_segments(current_joints, target_joints, max_joint_step=max_joint_step)
-            if segments:
-                return (
-                    [{"cmd": "move_joints", "joints": values} for values in segments],
-                    {
-                        "fallback": {
-                            "used": True,
-                            "strategy": "calibrated-planar-ik",
-                            **fallback_details,
-                            "target_joints": [float(value) for value in target_joints],
-                        }
-                    },
-                )
-
-    approximate = _approximate_joint_fallback_target(current_pose, target_pose, current_joints)
-    if approximate is None:
-        return None
-
-    target_joints, fallback_details = approximate
-    segments = _build_joint_segments(current_joints, target_joints, max_joint_step=max_joint_step)
-    if not segments:
-        return None
-
-    return (
-        [{"cmd": "move_joints", "joints": values} for values in segments],
-        {
-            "fallback": {
-                "used": True,
-                "strategy": "joint-space-cylindrical-approximation",
-                **fallback_details,
-                "target_joints": [float(value) for value in target_joints],
-            }
-        },
-    )
 
 
 async def _wait_for_confirmation(command: Mapping[str, Any], *, confirm_prompt: bool, delay_s: float) -> bool:
@@ -391,6 +289,23 @@ async def _deliver_response(voice: Any, text: str, *, typed_input: bool) -> None
     await voice.speak(text)
 
 
+async def _dispatch_with_estop(arm: Any, command: Mapping[str, Any]) -> dict[str, Any]:
+    """Dispatch an arm command while polling for 'q' e-stop in parallel."""
+    task = asyncio.create_task(dispatch_arm_command(arm, command))
+    try:
+        while not task.done():
+            if _kbhit_q():
+                task.cancel()
+                print("E-stop! Pressing q detected — stopping arm.")
+                await arm.emergency_stop()
+                raise SafetyAbortError("Emergency stop requested (q pressed).")
+            await asyncio.sleep(0.05)
+        return task.result()
+    except asyncio.CancelledError:
+        await arm.emergency_stop()
+        raise SafetyAbortError("Emergency stop requested (q pressed).")
+
+
 async def execute_guarded_arm_command(
     arm: Any,
     voice: Any,
@@ -402,162 +317,8 @@ async def execute_guarded_arm_command(
     max_joint_step: float,
     use_cli_prompt: bool,
 ) -> dict[str, Any]:
-    cmd = str(command.get("cmd", "")).lower()
-    del checkpoint_interval_s
-    if not _is_segmented_motion(command):
-        return await dispatch_arm_command(arm, command)
-
-    if cmd == "move_joint":
-        state = await arm.get_state()
-        target_index = int(command["joint_index"])
-        target_value = float(command["value"])
-        current = list(state.joint_positions)
-        if not current:
-            current = [0.0] * max(target_index + 1, 5)
-        elif target_index >= len(current):
-            current.extend([0.0] * (target_index + 1 - len(current)))
-        target = list(current)
-        target[target_index] = target_value
-        segments = _build_joint_segments(current, target, max_joint_step=max_joint_step)
-        segment_commands = [{"cmd": "move_joints", "joints": values} for values in segments]
-        result_payload = {"handled": cmd, "joint_index": target_index, "value": target_value}
-    elif cmd == "move_joint_relative":
-        state = await arm.get_state()
-        target_index = int(command["joint_index"])
-        delta_degrees = float(command["delta_degrees"])
-        current = list(state.joint_positions)
-        if not current:
-            current = [0.0] * max(target_index + 1, 5)
-        elif target_index >= len(current):
-            current.extend([0.0] * (target_index + 1 - len(current)))
-        target = list(current)
-        target[target_index] = float(target[target_index]) + delta_degrees
-        segments = _build_joint_segments(current, target, max_joint_step=max_joint_step)
-        segment_commands = [{"cmd": "move_joints", "joints": values} for values in segments]
-        result_payload = {
-            "handled": cmd,
-            "joint_index": target_index,
-            "delta_degrees": delta_degrees,
-            "value": target[target_index],
-            "direction": str(command.get("direction", "")),
-        }
-    elif cmd == "move_joints":
-        state = await arm.get_state()
-        target = [float(value) for value in command.get("joints", [])]
-        current = list(state.joint_positions)
-        segments = _build_joint_segments(current, target, max_joint_step=max_joint_step)
-        segment_commands = [{"cmd": "move_joints", "joints": values} for values in segments]
-        result_payload = {"handled": cmd, "joint_count": len(target)}
-    elif cmd == "move_to_position":
-        state = await arm.get_state()
-        current_pose = ArmPose.from_value(state.pose)
-        target_pose = target_pose_from_fields(current_pose, command.get("pose", {}))
-        segments = _build_pose_segments(
-            current_pose,
-            target_pose,
-            max_cartesian_step_mm=max_cartesian_step_mm,
-        )
-        segment_commands = [{"cmd": "move_to_position", "pose": segment.to_dict()} for segment in segments]
-        result_payload = {"handled": cmd, "pose": target_pose.to_dict()}
-    elif cmd == "move_axis_to":
-        state = await arm.get_state()
-        current_pose = ArmPose.from_value(state.pose)
-        axis = str(command.get("axis", "")).lower()
-        if axis not in {"x", "y", "z"}:
-            raise ArmControlError(f"Unsupported pose axis: {axis}")
-        target_pose = target_pose_from_fields(current_pose, {axis: float(command.get("value", 0.0))})
-        segments = _build_pose_segments(
-            current_pose,
-            target_pose,
-            max_cartesian_step_mm=max_cartesian_step_mm,
-        )
-        segment_commands = [{"cmd": "move_to_position", "pose": segment.to_dict()} for segment in segments]
-        result_payload = {
-            "handled": cmd,
-            "axis": axis,
-            "value": float(command.get("value", 0.0)),
-            "pose": target_pose.to_dict(),
-        }
-    elif cmd == "move_relative":
-        state = await arm.get_state()
-        current_pose = ArmPose.from_value(state.pose)
-        target_pose = target_pose_from_relative(current_pose, command)
-        segments = _build_pose_segments(
-            current_pose,
-            target_pose,
-            max_cartesian_step_mm=max_cartesian_step_mm,
-        )
-        segment_commands = [{"cmd": "move_to_position", "pose": segment.to_dict()} for segment in segments]
-        result_payload = {
-            "handled": cmd,
-            "direction": str(command.get("direction", "")),
-            "distance_mm": float(command.get("distance_mm", 0.0)),
-            "pose": target_pose.to_dict(),
-        }
-    else:  # home
-        home_joints = list(load_config().arm.home_joint_positions)
-        if home_joints:
-            state = await arm.get_state()
-            segments = _build_joint_segments(
-                list(state.joint_positions),
-                home_joints,
-                max_joint_step=max_joint_step,
-            )
-            segment_commands = [{"cmd": "move_joints", "joints": values} for values in segments]
-            result_payload = {"handled": cmd}
-        else:
-            return await dispatch_arm_command(arm, command)
-
-    total_segments = max(1, len(segment_commands))
-    segment_idx = 1
-    fallback_attempted = False
-    while segment_idx <= len(segment_commands):
-        segment_command = segment_commands[segment_idx - 1]
-        try:
-            await dispatch_arm_command(arm, segment_command)
-        except ArmControlError as exc:
-            if fallback_attempted or cmd != "move_relative" or not _looks_like_cartesian_ik_failure(exc):
-                raise
-
-            fallback_plan = await _build_joint_fallback_for_relative(
-                arm,
-                command,
-                target_pose=target_pose,
-                max_joint_step=max_joint_step,
-            )
-            if fallback_plan is None:
-                raise
-
-            fallback_attempted = True
-            segment_commands, fallback_payload = fallback_plan
-            total_segments = max(1, len(segment_commands))
-            result_payload.update(fallback_payload)
-            fallback_strategy = str(fallback_payload.get("fallback", {}).get("strategy", "joint-space fallback"))
-            print(
-                _console_safe(
-                    f"Cartesian gripper move was unreachable; retrying with {fallback_strategy}."
-                )
-            )
-            segment_idx = 1
-            continue
-
-        print(_console_safe(f"Completed segment {segment_idx}/{total_segments} for {_describe_command(command)}."))
-
-        if segment_idx < total_segments:
-            approved = await _checkpoint_confirmation(
-                voice,
-                command,
-                segment_idx=segment_idx + 1,
-                total_segments=total_segments,
-                confirm_timeout_s=confirm_timeout_s,
-                use_cli_prompt=use_cli_prompt,
-            )
-            if not approved:
-                await arm.emergency_stop()
-                raise SafetyAbortError("Safety checkpoint timed out or was rejected.")
-        segment_idx += 1
-
-    return {"ok": True, "segmented": True, "segments": total_segments, **result_payload}
+    """Execute an arm command with 'q' e-stop monitoring. VIAM handles smooth motion."""
+    return await _dispatch_with_estop(arm, command)
 
 
 async def run_demo(
@@ -595,7 +356,7 @@ async def run_demo(
         print("For degree rotation, use explicit phrases like 'rotate left 5 degrees', 'turn right 10 degrees', or 'rotate up 5 degrees'.")
         print("Forward/back/left/right move in the current gripper frame. Up/down are vertical pose nudges.")
         print("Distances use millimeters unless you add a unit.")
-        print("Type 'exit' to stop.")
+        print("Press 'q' during motion to emergency stop. Type 'exit' to quit.")
     else:
         print("Voice arm demo ready.")
         print("Say commands like: 'open the gripper', 'close the gripper', 'move left 5',")
@@ -774,7 +535,7 @@ async def _main() -> int:
     if args.max_cartesian_step_mm <= 0 or args.max_joint_step <= 0:
         print("--max-cartesian-step-mm and --max-joint-step must be positive.")
         return 2
-    default_confirm = sys.stdin.isatty() and not args.local_fake and not args.fake_voice
+    default_confirm = sys.stdin.isatty() and not args.local_fake and not args.fake_voice and not args.typed_input
     confirm_prompt = default_confirm if args.confirm is None else bool(args.confirm)
     delay_s = args.delay_seconds
     if delay_s is None:
