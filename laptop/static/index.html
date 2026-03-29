@@ -150,7 +150,7 @@
                   <div class="section-header">
                     <div>
                       <div class="card-title">Arm Voice Test</div>
-                      <div class="card-subtitle">Launches `arm_voice_demo.py` with mic/speaker checkpoints, segmented motion, and automatic shutdown on missed confirmations.</div>
+                      <div class="card-subtitle">Launches `arm_voice_demo.py` with mic/speaker safety checks, segmented motion, and automatic shutdown on missed confirmations.</div>
                     </div>
                     <span id="arm-voice-pill" class="status-pill status-disconnected">Idle</span>
                   </div>
@@ -159,7 +159,7 @@
                     <button class="danger-button" id="arm-voice-stop-button">Stop</button>
                   </div>
                   <div id="arm-voice-detail" class="inline-note">
-                    Press Start, then say things like "open the gripper" or "move joint 2 to 45". Longer motions are broken into small segments and require confirmation every 5 seconds.
+                    Press Start, then say things like "open the gripper" or "move joint 2 to 45". Longer motions are broken into guarded segments, with joint moves capped at 10 degrees before the next confirmation.
                   </div>
                 </section>
 

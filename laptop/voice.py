@@ -52,7 +52,7 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 SILENCE_THRESHOLD = 500     # RMS threshold for silence
 SILENCE_DURATION_S = 1.5    # seconds of silence to stop recording
-MAX_RECORD_S = 10.0         # max recording duration
+MAX_RECORD_S = 15.0         # allows time to start speaking before cutoff
 
 
 class VoiceInterface:
@@ -155,6 +155,7 @@ class VoiceInterface:
         logger.info("Listening... (speak now)")
         frames = []
         silence_frames = 0
+        heard_speech = False
         max_frames = max(1, int(max_record_s * SAMPLE_RATE / 1024))
         silence_limit = max(1, int(silence_duration_s * SAMPLE_RATE / 1024))
 
@@ -174,11 +175,13 @@ class VoiceInterface:
                 rms = (sum(s * s for s in samples) / len(samples)) ** 0.5
 
                 if rms < SILENCE_THRESHOLD:
-                    silence_frames += 1
+                    if heard_speech:
+                        silence_frames += 1
                 else:
+                    heard_speech = True
                     silence_frames = 0
 
-                if silence_frames >= silence_limit and len(frames) > 10:
+                if heard_speech and silence_frames >= silence_limit and len(frames) > 10:
                     break
 
             stream.stop()
@@ -187,7 +190,7 @@ class VoiceInterface:
             logger.error("Audio recording error: %s", exc)
             return None
 
-        if not frames:
+        if not frames or not heard_speech:
             return None
 
         # Encode as WAV

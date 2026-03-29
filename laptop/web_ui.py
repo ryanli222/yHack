@@ -1278,10 +1278,10 @@ class WebUI:
             sys.executable,
             str(self._workspace_dir / "laptop" / "arm_voice_demo.py"),
             "--no-confirm",
-            "--checkpoint-seconds",
-            "5",
             "--confirmation-timeout-seconds",
             "3",
+            "--max-joint-step",
+            "10",
         ]
         if mode == "local_fake":
             command.append("--local-fake")

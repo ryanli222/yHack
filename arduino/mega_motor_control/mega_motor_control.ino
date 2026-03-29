@@ -10,12 +10,17 @@
  *   Send:    {"estop": 0|1, "enc": [dFL, dFR, dRL, dRR]}
  *            enc = delta ticks since last report (signed int32)
  *
+ * Motor driver wiring (IBT-2 RPWM/LPWM):
+ *   FL: RPWM=D13, LPWM=D12
+ *   FR: RPWM=D4,  LPWM=D5
+ *   RL: RPWM=D10, LPWM=D11
+ *   RR: RPWM=D2,  LPWM=D3
  * Encoder wiring (quadrature, 1x decode on channel A):
- *   FL: A=D2 (INT0),  B=D3
- *   FR: A=D18(INT5),  B=D19
- *   RL: A=D20(INT3),  B=D21
- *   RR: A=D22(polled),B=D23
- * E-stop: D32 (active LOW, polled — freed D2 for FL encoder)
+ *   FL: A=D2(INT0), B=D3 — CONFLICT with RR motor pins; move if using encoders
+ *   FR: A=D18(INT5), B=D19
+ *   RL: A=D20(INT3), B=D21
+ *   RR: A=D22(polled), B=D23
+ * E-stop: D32 (active LOW, polled)
  *
  * Dependencies: ArduinoJson (v7.x)
  */
@@ -26,21 +31,23 @@
 // 1. PIN DEFINITIONS
 // ============================================================
 
-// Motor FL (Front-Left)
-#define PIN_FL_RPWM   4
-#define PIN_FL_LPWM   5
+// Motor FL (Front-Left)  — driver 1
+#define PIN_FL_RPWM  13
+#define PIN_FL_LPWM  12
 
-// Motor FR (Front-Right)
-#define PIN_FR_RPWM   6
-#define PIN_FR_LPWM   7
+// Motor FR (Front-Right) — driver 3
+#define PIN_FR_RPWM   4
+#define PIN_FR_LPWM   5
 
-// Motor RL (Rear-Left)
-#define PIN_RL_RPWM   8
-#define PIN_RL_LPWM   9
+// Motor RL (Rear-Left)   — driver 2
+#define PIN_RL_RPWM  10
+#define PIN_RL_LPWM  11
 
-// Motor RR (Rear-Right)
-#define PIN_RR_RPWM  10
-#define PIN_RR_LPWM  11
+// Motor RR (Rear-Right)  — driver 4
+// NOTE: D2/D3 were previously FL encoder A/B. If encoders are wired,
+//       move FL encoder to free pins (e.g. D34/D35) and update below.
+#define PIN_RR_RPWM   2
+#define PIN_RR_LPWM   3
 
 // E-stop button (active LOW, polled — D32 has no external INT on Mega)
 #define PIN_ESTOP     32
@@ -67,7 +74,7 @@ const int MOTOR_SIGN[4] = { +1,  +1,  +1,  +1 };
 //                            FL   FR   RL   RR
 const int ENC_SIGN[4]   = { +1,  +1,  +1,  +1 };
 
-#define PWM_MAX              60   // SAFETY: keep low until hardware verified. Max is 255.
+#define PWM_MAX              15   // TESTING: just enough to verify motors respond. Raise to 60+ once verified. Max is 255.
 #define SERIAL_BAUD         115200
 #define WATCHDOG_TIMEOUT_MS 500
 #define LOOP_PERIOD_MS       10   // ~100 Hz
@@ -153,11 +160,13 @@ void stopAllMotors() {
 // ============================================================
 
 void computeMecanumIK(float vx, float vy, float omega) {
+  // X mecanum configuration — rollers diagonal is opposite to H/O drive.
+  // FL/RR share +Vy; FR/RL share -Vy.
   float raw[4];
-  raw[FL] = vx - vy - omega;
-  raw[FR] = vx + vy + omega;
-  raw[RL] = vx + vy - omega;
-  raw[RR] = vx - vy + omega;
+  raw[FL] = vx + vy - omega;
+  raw[FR] = vx - vy + omega;
+  raw[RL] = vx - vy - omega;
+  raw[RR] = vx + vy + omega;
 
   float maxVal = 0.0f;
   for (uint8_t i = 0; i < 4; i++) {
