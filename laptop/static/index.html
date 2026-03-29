@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Wheelchair Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="topbar-left">
+          <div class="breadcrumbs">
+            <span id="breadcrumb-root">Wheelchair</span>
+            <span class="breadcrumb-separator">&rsaquo;</span>
+            <span id="breadcrumb-leaf">main</span>
+          </div>
+          <h1 id="robot-name">Autonomous Wheelchair</h1>
+        </div>
+        <div class="topbar-right">
+          <span id="connection-pill" class="status-pill status-offline">Offline</span>
+          <span id="snapshot-rate" class="meta-text">0 Hz</span>
+        </div>
+      </header>
+
+      <div class="layout">
+        <aside class="sidebar">
+          <section class="panel robot-panel">
+            <div class="section-header">
+              <div>
+                <div class="eyebrow">Robot</div>
+                <div class="robot-title" id="sidebar-robot-name">Autonomous Wheelchair</div>
+              </div>
+              <span id="sidebar-live-pill" class="status-pill status-offline">Offline</span>
+            </div>
+            <div class="robot-status-row">
+              <span class="robot-dot" id="robot-dot"></span>
+              <span id="robot-status-text">Waiting for telemetry</span>
+            </div>
+          </section>
+
+          <details class="panel tree-panel" open>
+            <summary class="panel-summary">Subsystems</summary>
+            <div id="subsystems-tree" class="tree-list"></div>
+          </details>
+
+          <details class="panel tree-panel modules-panel" open>
+            <summary class="panel-summary">Modules</summary>
+            <div id="modules-list" class="modules-list"></div>
+          </details>
+        </aside>
+
+        <main class="main-column">
+          <section class="panel tabs-panel">
+            <div class="tab-bar">
+              <button class="tab-button active" data-tab="configure">CONFIGURE</button>
+              <button class="tab-button" data-tab="control">CONTROL</button>
+              <button class="tab-button" data-tab="map">MAP</button>
+              <button class="tab-button" data-tab="foxglove">FOXGLOVE</button>
+              <button class="tab-button" data-tab="logs">LOGS</button>
+            </div>
+
+            <div class="tab-content active" id="tab-configure">
+              <div class="section-toolbar">
+                <div>
+                  <div class="section-title">Runtime Configuration</div>
+                  <div class="section-subtitle">Editable dashboard snapshot for the live demo session.</div>
+                </div>
+                <div class="toolbar-actions">
+                  <button class="secondary-button" id="refresh-config-button">Refresh</button>
+                  <button class="primary-button" id="save-config-button">Save</button>
+                </div>
+              </div>
+              <div id="config-note" class="info-banner">
+                Saving updates the dashboard snapshot only. Live module hot-reload is not wired yet.
+              </div>
+              <div id="config-form" class="config-sections"></div>
+            </div>
+
+            <div class="tab-content" id="tab-control">
+              <div class="control-grid">
+                <section class="card telemetry-card">
+                  <div class="card-title">Pose</div>
+                  <div class="kv-grid">
+                    <div class="kv-row"><span class="kv-label">x</span><span id="pose-x" class="kv-value">0.00 m</span></div>
+                    <div class="kv-row"><span class="kv-label">y</span><span id="pose-y" class="kv-value">0.00 m</span></div>
+                    <div class="kv-row"><span class="kv-label">theta</span><span id="pose-theta" class="kv-value">0.00 rad</span></div>
+                  </div>
+                </section>
+
+                <section class="card telemetry-card">
+                  <div class="card-title">Velocity</div>
+                  <div class="kv-grid">
+                    <div class="kv-row"><span class="kv-label">vx</span><span id="vel-vx" class="kv-value">0.00 m/s</span></div>
+                    <div class="kv-row"><span class="kv-label">vy</span><span id="vel-vy" class="kv-value">0.00 m/s</span></div>
+                    <div class="kv-row"><span class="kv-label">omega</span><span id="vel-omega" class="kv-value">0.00 rad/s</span></div>
+                  </div>
+                </section>
+
+                <section class="card telemetry-card">
+                  <div class="card-title">State</div>
+                  <div class="kv-grid">
+                    <div class="kv-row"><span class="kv-label">mode</span><span id="nav-mode" class="kv-value">manual</span></div>
+                    <div class="kv-row"><span class="kv-label">state</span><span id="nav-state" class="kv-value">Idle</span></div>
+                    <div class="kv-row"><span class="kv-label">e-stop</span><span id="nav-estop" class="kv-value">Clear</span></div>
+                  </div>
+                </section>
+
+                <section class="card telemetry-card">
+                  <div class="card-title">Estimator</div>
+                  <div class="kv-grid">
+                    <div class="kv-row"><span class="kv-label">frame</span><span id="pose-frame" class="kv-value">world</span></div>
+                    <div class="kv-row"><span class="kv-label">cov xy</span><span id="pose-cov-xy" class="kv-value">n/a</span></div>
+                    <div class="kv-row"><span class="kv-label">cov theta</span><span id="pose-cov-theta" class="kv-value">n/a</span></div>
+                  </div>
+                </section>
+
+                <section class="card telemetry-card">
+                  <div class="card-title">IMU</div>
+                  <div class="kv-grid">
+                    <div class="kv-row"><span class="kv-label">status</span><span id="imu-status" class="kv-value">idle</span></div>
+                    <div class="kv-row"><span class="kv-label">gyro z</span><span id="imu-gyro-z" class="kv-value">0.00 rad/s</span></div>
+                    <div class="kv-row"><span class="kv-label">packet age</span><span id="imu-age" class="kv-value">n/a</span></div>
+                  </div>
+                </section>
+
+                <section class="card teleop-card">
+                  <div class="card-title">Manual Teleop</div>
+                  <div class="card-subtitle">Drag the joystick or use WASD.</div>
+                  <div class="teleop-layout">
+                    <div class="joystick-shell">
+                      <div id="joystick-pad" class="joystick-pad">
+                        <div id="joystick-knob" class="joystick-knob"></div>
+                      </div>
+                      <div id="joystick-readout" class="joystick-readout">vx 0.00 | vy 0.00</div>
+                    </div>
+                    <div class="teleop-buttons">
+                      <button class="secondary-button teleop-button" data-teleop="forward">Forward</button>
+                      <div class="teleop-button-row">
+                        <button class="secondary-button teleop-button" data-teleop="left">Left</button>
+                        <button class="danger-button" id="stop-button">Stop</button>
+                        <button class="secondary-button teleop-button" data-teleop="right">Right</button>
+                      </div>
+                      <button class="secondary-button teleop-button" data-teleop="back">Back</button>
+                    </div>
+                  </div>
+                </section>
+
+                <section class="card arm-voice-card">
+                  <div class="section-header">
+                    <div>
+                      <div class="card-title">Arm Voice Test</div>
+                      <div class="card-subtitle">Launches `arm_voice_demo.py` with mic/speaker checkpoints, segmented motion, and automatic shutdown on missed confirmations.</div>
+                    </div>
+                    <span id="arm-voice-pill" class="status-pill status-disconnected">Idle</span>
+                  </div>
+                  <div class="toolbar-actions arm-voice-actions">
+                    <button class="primary-button" id="arm-voice-start-button">Start Listening</button>
+                    <button class="danger-button" id="arm-voice-stop-button">Stop</button>
+                  </div>
+                  <div id="arm-voice-detail" class="inline-note">
+                    Press Start, then say things like "open the gripper" or "move joint 2 to 45". Longer motions are broken into small segments and require confirmation every 5 seconds.
+                  </div>
+                </section>
+
+                <section class="card arm-voice-card">
+                  <div class="section-header">
+                    <div>
+                      <div class="card-title">Ball Pickup</div>
+                      <div class="card-subtitle">VIAM detection plus a constrained pregrasp, grasp, and lift sequence.</div>
+                    </div>
+                    <span id="pickup-pill" class="status-pill status-disconnected">Idle</span>
+                  </div>
+                  <div class="toolbar-actions arm-voice-actions">
+                    <button class="secondary-button" id="pickup-refresh-button">Refresh Detection</button>
+                    <button class="primary-button" id="pickup-start-button">Pick Up Ball</button>
+                    <button class="danger-button" id="pickup-stop-button">Stop</button>
+                  </div>
+                  <div id="pickup-detail" class="inline-note">
+                    Waiting for a VIAM ball detection.
+                  </div>
+                  <div class="kv-grid">
+                    <div class="kv-row"><span class="kv-label">label</span><span id="pickup-label" class="kv-value">n/a</span></div>
+                    <div class="kv-row"><span class="kv-label">confidence</span><span id="pickup-confidence" class="kv-value">n/a</span></div>
+                    <div class="kv-row"><span class="kv-label">range</span><span id="pickup-range" class="kv-value">n/a</span></div>
+                    <div class="kv-row"><span class="kv-label">lateral</span><span id="pickup-lateral" class="kv-value">n/a</span></div>
+                    <div class="kv-row"><span class="kv-label">zone</span><span id="pickup-zone" class="kv-value">No target</span></div>
+                    <div class="kv-row"><span class="kv-label">attempts</span><span id="pickup-attempts" class="kv-value">0</span></div>
+                  </div>
+                </section>
+
+                <section class="card goto-card">
+                  <div class="card-title">Go To</div>
+                  <div class="goto-controls">
+                    <label class="field-label" for="waypoint-select">Waypoint</label>
+                    <select id="waypoint-select" class="text-input"></select>
+                    <div class="goto-actions">
+                      <button class="primary-button" id="goto-button">Dispatch</button>
+                      <button class="secondary-button" id="reload-waypoints-button">Reload</button>
+                    </div>
+                  </div>
+                  <div id="goal-summary" class="goal-summary">No active goal.</div>
+                  <div id="command-queue-note" class="inline-note">Commands are queued here until the control loop consumes them.</div>
+                </section>
+              </div>
+            </div>
+
+            <div class="tab-content" id="tab-map">
+              <div class="section-toolbar">
+                <div>
+                  <div class="section-title">Map View</div>
+                  <div class="section-subtitle">Occupancy, path, LiDAR scan, landmarks, and click actions.</div>
+                </div>
+                <div class="toolbar-actions">
+                  <button class="secondary-button map-mode-button active" data-map-mode="goal">Set Goal</button>
+                  <button class="secondary-button map-mode-button" data-map-mode="landmark">Add Landmark</button>
+                </div>
+              </div>
+              <div class="map-shell">
+                <canvas id="map-canvas"></canvas>
+              </div>
+              <div class="map-footer">
+                <span id="map-mode-label">Click mode: goal</span>
+                <span id="map-cursor-coords">x 0.00, y 0.00</span>
+              </div>
+            </div>
+
+            <div class="tab-content" id="tab-foxglove">
+              <div class="section-toolbar">
+                <div>
+                  <div class="section-title">Foxglove Viewer</div>
+                  <div class="section-subtitle">Embedded live visualization backed by the Foxglove WebSocket bridge.</div>
+                </div>
+                <div class="toolbar-actions">
+                  <span id="foxglove-status-pill" class="status-pill status-disconnected">Unavailable</span>
+                  <button class="secondary-button" id="foxglove-reload-button">Reload</button>
+                  <button class="secondary-button" id="foxglove-open-button">Open External</button>
+                </div>
+              </div>
+              <div id="foxglove-note" class="info-banner">
+                Foxglove bridge is not active yet.
+              </div>
+              <div class="foxglove-meta">
+                <span class="foxglove-meta-label">Bridge</span>
+                <span id="foxglove-ws-url" class="foxglove-meta-value">ws://127.0.0.1:8765</span>
+              </div>
+              <div class="foxglove-shell">
+                <iframe
+                  id="foxglove-frame"
+                  title="Foxglove embedded viewer"
+                  loading="lazy"
+                  referrerpolicy="strict-origin-when-cross-origin"
+                ></iframe>
+              </div>
+            </div>
+
+            <div class="tab-content" id="tab-logs">
+              <div class="section-toolbar">
+                <div>
+                  <div class="section-title">Live Logs</div>
+                  <div class="section-subtitle">Color-coded activity from the dashboard and control stack.</div>
+                </div>
+                <div class="toolbar-actions">
+                  <button class="secondary-button" id="clear-log-view-button">Clear View</button>
+                </div>
+              </div>
+              <div id="log-viewer" class="log-viewer"></div>
+            </div>
+          </section>
+        </main>
+
+        <aside class="right-column">
+          <section class="panel camera-panel">
+            <div class="section-header">
+              <div>
+                <div class="section-title">Camera Feed</div>
+                <div class="section-subtitle">Live MJPEG stream with obstacle and pickup overlays.</div>
+              </div>
+            </div>
+            <div class="camera-shell">
+              <img id="camera-stream" alt="Camera stream" />
+              <canvas id="camera-overlay"></canvas>
+            </div>
+          </section>
+
+          <section class="panel data-panel">
+            <div class="section-title">Detected Obstacles</div>
+            <div id="obstacles-list" class="stack-list"></div>
+          </section>
+
+          <section class="panel data-panel">
+            <div class="section-title">Detected Landmarks</div>
+            <div id="landmarks-list" class="stack-list"></div>
+          </section>
+
+          <section class="panel data-panel">
+            <div class="section-title">Voice Transcript</div>
+            <div class="voice-block">
+              <div class="voice-label">Last command</div>
+              <div id="voice-transcript" class="voice-text">Waiting for command...</div>
+            </div>
+            <div class="voice-block">
+              <div class="voice-label">Response</div>
+              <div id="voice-response" class="voice-text">No response yet.</div>
+            </div>
+          </section>
+        </aside>
+      </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
