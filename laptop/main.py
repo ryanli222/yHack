@@ -39,6 +39,7 @@ from perception import create_perception
 from phone_imu import create_phone_imu
 from voice import create_voice_interface
 from llm_interface import create_llm_interface
+from waypoint_resolver import WaypointResolver
 
 logger = logging.getLogger("main")
 
@@ -99,6 +100,8 @@ class WheelchairSystem:
         self._nav_state = "idle"
         self._tick_count = 0
         self._last_tick = time.monotonic()
+        self._scan_ts = 0.0            # arrival time of the scan behind the current cmd
+        self._last_latency_log = 0.0
 
     async def start(self) -> None:
         logger.info("Starting wheelchair system (teleop=%s, lidar_only=%s)",
@@ -142,7 +145,13 @@ class WheelchairSystem:
                 await self.voice.start()
                 # Build waypoints from spatial memory landmarks + hardcoded waypoints
                 waypoints = self._build_waypoints()
-                self.llm = create_llm_interface(waypoints=waypoints)
+                # Cached waypoints / YOLO-labelled landmarks first, LLM on a miss
+                self.llm = WaypointResolver(
+                    waypoints, create_llm_interface(waypoints=waypoints),
+                    detections=self.perception.get_yolo_detections,
+                    lookup=self.spatial.lookup_landmark,
+                    resolution_m=self.slam.occupancy_grid.resolution,
+                )
                 logger.info("Voice + LLM ready (%d known locations)", len(waypoints))
             except Exception as e:
                 logger.warning("Voice/LLM failed: %s — voice commands unavailable", e)
@@ -316,6 +325,7 @@ class WheelchairSystem:
 
     async def _nav_loop(self) -> None:
         cfg = load_config()
+        period = 1.0 / cfg.planner.control_rate_hz
 
         while self._running:
             t0 = time.monotonic()
@@ -324,11 +334,13 @@ class WheelchairSystem:
             self._tick_count += 1
 
             # --- 1. Get LiDAR scan ---
+            scan = self.lidar.get_scan()
             scan_xy = self.lidar.get_points_xy()
 
             if scan_xy is None or scan_xy.shape[0] == 0:
                 await asyncio.sleep(0.02)
                 continue
+            self._scan_ts = scan.timestamp if scan is not None else 0.0
 
             # --- 2. Get current pose ---
             pose = self.pose.get_pose()
@@ -353,7 +365,7 @@ class WheelchairSystem:
                 if landmark.name:
                     wx = pose[0] + cos_t * landmark.x - sin_t * landmark.y
                     wy = pose[1] + sin_t * landmark.x + cos_t * landmark.y
-                    self.spatial.add_landmark(
+                    self.spatial.update_landmark(
                         landmark.name, wx, wy, landmark.descriptor,
                     )
 
@@ -422,9 +434,8 @@ class WheelchairSystem:
                     scan_xy.shape[0],
                 )
 
-            # Target 20 Hz
             elapsed = time.monotonic() - t0
-            await asyncio.sleep(max(0, 0.05 - elapsed))
+            await asyncio.sleep(max(0, period - elapsed))
 
     # ------------------------------------------------------------------
     # Serial loop: send commands, read feedback
@@ -435,6 +446,12 @@ class WheelchairSystem:
             try:
                 await self.serial.send_velocity(
                     self._cmd_vx, self._cmd_vy, self._cmd_omega)
+
+                # Scan arrival -> serial send, logged every 2 s (measured, not assumed)
+                now = time.monotonic()
+                if self._scan_ts and now - self._last_latency_log > 2.0:
+                    self._last_latency_log = now
+                    logger.info("scan-to-motor latency: %.0f ms", (now - self._scan_ts) * 1e3)
 
                 resp = await self.serial.read_response()
                 if resp:

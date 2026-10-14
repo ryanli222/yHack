@@ -119,7 +119,8 @@ class SLAMConfig:
 
 @dataclass
 class PlannerConfig:
-    replan_interval_s: float = 2.0
+    control_rate_hz: float = 20.0     # nav loop: local replan + velocity update (10-20 Hz)
+    replan_interval_s: float = 2.0    # global A* replan
     dwa_time_horizon_s: float = 1.0
     dwa_num_samples: int = 100
     potential_field_range_m: float = 1.5

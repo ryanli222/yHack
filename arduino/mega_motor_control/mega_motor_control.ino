@@ -20,8 +20,11 @@
  *   Note: single-char movement commands are momentary and only keep moving
  *   while commands continue arriving. The watchdog cuts motion quickly
  *   (~250ms), so repeat-while-held senders behave like hold-to-move teleop.
- *   Send:    {"estop": 0|1, "enc": [dFL, dFR, dRL, dRR]}
+ *   Send:    {"estop": 0|1, "enc": [dFL, dFR, dRL, dRR]}   (20 Hz)
  *            enc = delta ticks since last report (signed int32)
+ *
+ * Control: CONTROL_HZ (100 Hz) loop. Mecanum IK gives a feedforward PWM per
+ *   wheel; a per-wheel PID on encoder tick rate trims it (see section 8).
  *
  * Motor driver wiring (IBT-2 RPWM/LPWM):
  *   FL: RPWM=D13, LPWM=D12
@@ -83,12 +86,24 @@ const int MOTOR_SIGN[4] = { -1,  +1,  -1,  +1 };
 //                            FL   FR   RL   RR
 const int ENC_SIGN[4]   = { +1,  +1,  +1,  +1 };
 
-#define PWM_MAX             180   // Higher demo power for stronger motion/rotation authority.
+#define PWM_MAX             210   // Higher demo power for stronger motion/rotation authority.
 #define ROTATION_OMEGA_FULL 0.5f  // Pure in-place turns reach full PWM by omega=0.5.
 #define SERIAL_BAUD         115200
 #define WATCHDOG_TIMEOUT_MS 250   // Hold-to-run: commands must be refreshed continuously.
-#define LOOP_PERIOD_MS       50   // ~20 Hz
+#define CONTROL_HZ          100   // encoder PID loop rate
+#define LOOP_PERIOD_MS      (1000 / CONTROL_HZ)
+#define ENC_REPORT_EVERY      5   // {"estop","enc"} JSON every N loops (20 Hz)
 #define SERIAL_BUF_SIZE     128
+
+// ---- Wheel-speed PID: TUNING KNOBS, untuned defaults. Set all gains to 0 for
+// pure open-loop (identical to the pre-PID behaviour). ----
+// Free-running tick rate at PWM_MAX. Measure it with the '1'-'4' spin test:
+// ("end enc" delta) / (run seconds).
+const float WHEEL_TICKS_PER_S_AT_PWM_MAX = 2000.0f;
+const float PID_KP    = 0.05f;   // PWM counts per (tick/s) of error
+const float PID_KI    = 0.30f;   // PWM counts per (tick/s * s)
+const float PID_KD    = 0.0f;    // PWM counts per (tick/s^2)
+const float PID_I_MAX = 60.0f;   // anti-windup clamp on the integral term (PWM counts)
 
 // ============================================================
 // 3. INTERNAL STATE
@@ -118,6 +133,14 @@ int32_t encRunStart[4] = { 0, 0, 0, 0 };
 int activeMotors[4] = { 0, 0, 0, 0 };
 
 bool motorsRunning = false;
+
+// PID state (per wheel)
+int32_t encPrev[4]       = { 0, 0, 0, 0 };   // counts at last PID step
+float   pidIntegral[4]   = { 0, 0, 0, 0 };
+float   pidPrevErr[4]    = { 0, 0, 0, 0 };
+int32_t encReportBase[4] = { 0, 0, 0, 0 };   // counts at last JSON report
+uint8_t reportTick = 0;
+unsigned long lastPidMicros = 0;
 
 // ============================================================
 // 4. ENCODER ISRs
@@ -169,6 +192,8 @@ void stopAllMotors() {
     analogWrite(pinRPWM[i], 0);
     analogWrite(pinLPWM[i], 0);
     motorCommand[i] = 0;
+    pidIntegral[i] = 0.0f;
+    pidPrevErr[i] = 0.0f;
   }
 }
 
@@ -283,8 +308,57 @@ void readSerial() {
 }
 
 // ============================================================
-// 8. ENCODER REPORTING
+// 8. WHEEL-SPEED PID + ENCODER REPORTING
 // ============================================================
+
+// Closed loop around encoder tick rate. motorCommand[] (from IK) is both the
+// feedforward PWM and, scaled, the target tick rate; PID trims the PWM so all
+// four wheels track their targets under load. setMotor() clamps to +/-PWM_MAX.
+void runWheelPID(float dt) {
+  int32_t snap[4];
+  noInterrupts();
+  for (uint8_t i = 0; i < 4; i++) snap[i] = encCount[i];
+  interrupts();
+
+  for (uint8_t i = 0; i < 4; i++) {
+    float measured = (float)(snap[i] - encPrev[i]) / dt;   // ticks/s, same sign frame as motorCommand
+    encPrev[i] = snap[i];
+
+    if (motorCommand[i] == 0) {
+      pidIntegral[i] = 0.0f;
+      pidPrevErr[i] = 0.0f;
+      setMotor(i, 0);
+      continue;
+    }
+
+    float target = (float)motorCommand[i] / (float)PWM_MAX * WHEEL_TICKS_PER_S_AT_PWM_MAX;
+    float err = target - measured;
+    pidIntegral[i] = constrain(pidIntegral[i] + err * dt * PID_KI, -PID_I_MAX, PID_I_MAX);
+    float deriv = (err - pidPrevErr[i]) / dt;
+    pidPrevErr[i] = err;
+
+    int out = motorCommand[i] + (int)(PID_KP * err + pidIntegral[i] + PID_KD * deriv);
+    setMotor(i, out);
+  }
+}
+
+// {"estop":0|1,"enc":[dFL,dFR,dRL,dRR]} — delta ticks since last report.
+void reportEncoders() {
+  int32_t snap[4];
+  noInterrupts();
+  for (uint8_t i = 0; i < 4; i++) snap[i] = encCount[i];
+  interrupts();
+
+  Serial.print("{\"estop\":");
+  Serial.print(estopActive ? 1 : 0);
+  Serial.print(",\"enc\":[");
+  for (uint8_t i = 0; i < 4; i++) {
+    Serial.print(snap[i] - encReportBase[i]);
+    if (i < 3) Serial.print(',');
+    encReportBase[i] = snap[i];
+  }
+  Serial.println("]}");
+}
 
 // Call when a new command starts — snapshot current counts and record active motors
 void startRunSnapshot() {
@@ -341,11 +415,12 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_RR_A), encISR_RR, RISING);
 
   lastCommandTime = millis();
+  lastPidMicros = micros();
   Serial.println("{\"status\":\"ready\"}");
 }
 
 // ============================================================
-// 10. MAIN LOOP (~100 Hz)
+// 10. MAIN LOOP (CONTROL_HZ = 100 Hz)
 // ============================================================
 
 void loop() {
@@ -359,11 +434,21 @@ void loop() {
     stopAllMotors();
   }
 
-  // Drive or stop motors
+  // Drive (closed loop) or stop motors
+  unsigned long nowMicros = micros();
+  float dt = (nowMicros - lastPidMicros) * 1e-6f;
+  lastPidMicros = nowMicros;
+  if (dt <= 0.0f) dt = 1.0f / CONTROL_HZ;
   if (estopActive) {
     stopAllMotors();
   } else {
-    for (uint8_t i = 0; i < 4; i++) setMotor(i, motorCommand[i]);
+    runWheelPID(dt);
+  }
+
+  // Encoder / e-stop feedback to the laptop
+  if (++reportTick >= ENC_REPORT_EVERY) {
+    reportTick = 0;
+    reportEncoders();
   }
 
   // Maintain loop rate

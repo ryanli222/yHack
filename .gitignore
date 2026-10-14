@@ -5,3 +5,5 @@ __pycache__/
 *.pyc
 data/recordings/
 PROJECT_OVERVIEW.md
+data/models/
+.pytest_cache/
